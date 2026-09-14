@@ -102,7 +102,7 @@ export const MowerStatus = () => {
 
     return (
         <>
-            <Space size="small" style={{flexShrink: 0}}>
+            <Space size="small" wrap style={{flexShrink: 0, rowGap: 4, justifyContent: 'flex-end'}}>
                 <Space size={4}>
                     <Badge
                         color={statusColor(stateNum, isEmergency, colors)}
