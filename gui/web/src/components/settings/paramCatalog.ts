@@ -44,6 +44,7 @@ const CATALOG: Record<string, ParamMeta> = {
   blade_load_min_speed_ratio: {label: "paramCatalog.blade_load_min_speed_ratio.label", description: "paramCatalog.blade_load_min_speed_ratio.description", tier: "middle", group: "Coverage"},
   blade_load_telemetry_max_age_s: {label: "paramCatalog.blade_load_telemetry_max_age_s.label", description: "paramCatalog.blade_load_telemetry_max_age_s.description", tier: "expert", group: "Coverage", unit: "s"},
   num_headland_passes: {label: "paramCatalog.num_headland_passes.label", description: "paramCatalog.num_headland_passes.description", tier: "basic", group: "Coverage"},
+  connector_max_headland_passes: {label: "paramCatalog.connector_max_headland_passes.label", description: "paramCatalog.connector_max_headland_passes.description", tier: "middle", group: "Coverage"},
   headland_width: {label: "paramCatalog.headland_width.label", description: "paramCatalog.headland_width.description", tier: "middle", group: "Coverage", unit: "m"},
   swath_overlap: {label: "paramCatalog.swath_overlap.label", description: "paramCatalog.swath_overlap.description", tier: "middle", group: "Coverage", unit: "m"},
   mow_angle_deg: {label: "paramCatalog.mow_angle_deg.label", description: "paramCatalog.mow_angle_deg.description", tier: "basic", group: "Coverage", unit: "°"},
@@ -100,12 +101,15 @@ const CATALOG: Record<string, ParamMeta> = {
   // FollowCoveragePath.obstacle_clearance_margin (navigation.launch.py).
   // Note obstacle_inflation_radius cannot substitute — the deviation checks
   // threshold at cost 253, a band sized by the footprint inscribed radius.
+  transit_dynamic_window: {label: "paramCatalog.transit_dynamic_window.label", description: "paramCatalog.transit_dynamic_window.description", tier: "expert", group: "Navigation"},
+  coverage_goal_checker_id: {label: "paramCatalog.coverage_goal_checker_id.label", description: "paramCatalog.coverage_goal_checker_id.description", tier: "expert", group: "Coverage"},
+  local_inflation_inscribed_radius: {label: "paramCatalog.local_inflation_inscribed_radius.label", description: "paramCatalog.local_inflation_inscribed_radius.description", tier: "expert", group: "Obstacles", unit: "m"},
   obstacle_clearance_margin: {label: "paramCatalog.obstacle_clearance_margin.label", description: "paramCatalog.obstacle_clearance_margin.description", tier: "middle", group: "Obstacles", unit: "m"},
 
   // ── Motor control (firmware-adjacent PID) ────────────────────────────────
   // 2026-07-17 Option C (task #34): angular_rate_kp/ki/kff (the host-side
   // yaw-rate PI, Option B task #24) are removed — the loop now runs in
-  // firmware (task #33), tuned via these params (PACKET_ID_LL_SET_YAW_PID).
+  // firmware (task #33), tuned via these params (protocol v7 SET_PARAM, persisted in the board's flash).
   yaw_kp: {label: "paramCatalog.yaw_kp.label", description: "paramCatalog.yaw_kp.description", tier: "expert", group: "Motor control"},
   yaw_ki: {label: "paramCatalog.yaw_ki.label", description: "paramCatalog.yaw_ki.description", tier: "expert", group: "Motor control"},
   yaw_trim_limit_mps: {label: "paramCatalog.yaw_trim_limit_mps.label", description: "paramCatalog.yaw_trim_limit_mps.description", tier: "expert", group: "Motor control", unit: "m/s"},

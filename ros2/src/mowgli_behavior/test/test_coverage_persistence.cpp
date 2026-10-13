@@ -19,6 +19,7 @@
 // changed map is detected as stale.
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
 
@@ -27,6 +28,129 @@
 #include <gtest/gtest.h>
 
 using mowgli_behavior::BTContext;
+
+TEST(CoveragePersistence, NeverEnabledHasNoCompletedPhaseHistory)
+{
+  BTContext ctx;
+  ctx.coverage_resume_path = ::testing::TempDir() + "/cross_hatch_disabled.txt";
+  EXPECT_FALSE(mowgli_behavior::beginCoverageOrientation(ctx, 2));
+  mowgli_behavior::markCoverageStarted(ctx, 2);
+  EXPECT_TRUE(ctx.cross_hatch.empty());
+  ASSERT_TRUE(saveCoverageResumeState(ctx));
+  BTContext loaded;
+  loaded.coverage_resume_path = ctx.coverage_resume_path;
+  ASSERT_TRUE(loadCoverageResumeState(loaded));
+  loaded.mow_cross_hatch = true;  // changing config cannot rotate this resumed run
+  EXPECT_FALSE(mowgli_behavior::beginCoverageOrientation(loaded, 2));
+  EXPECT_TRUE(loaded.cross_hatch.empty());
+  ASSERT_TRUE(clearCoverageResumeState(loaded));  // progress reset retains latch
+  BTContext reset;
+  reset.coverage_resume_path = ctx.coverage_resume_path;
+  ASSERT_TRUE(loadCoverageResumeState(reset));
+  EXPECT_EQ(reset.base_orientation_areas.count(2), 1u);
+  reset.base_orientation_areas.clear();  // EndSession clears the temporary latch
+  ASSERT_TRUE(clearCoverageResumeState(reset));
+  EXPECT_FALSE(std::filesystem::exists(ctx.coverage_resume_path));
+  EXPECT_FALSE(std::filesystem::exists(ctx.coverage_resume_path + ".tmp"));
+}
+
+TEST(CoveragePersistence, DisablingDuringResumeRetainsPerpendicularAndHistory)
+{
+  BTContext ctx;
+  ctx.coverage_resume_path = ::testing::TempDir() + "/cross_hatch_toggle.txt";
+  ctx.mow_cross_hatch = true;
+  ctx.cross_hatch[2].next_perpendicular = true;
+  ASSERT_TRUE(mowgli_behavior::beginCoverageOrientation(ctx, 2));
+  BTContext loaded;
+  loaded.coverage_resume_path = ctx.coverage_resume_path;
+  ASSERT_TRUE(loadCoverageResumeState(loaded));
+  EXPECT_FALSE(loaded.mow_cross_hatch);
+  EXPECT_TRUE(mowgli_behavior::beginCoverageOrientation(loaded, 2));
+  mowgli_behavior::markCoverageStarted(loaded, 2);
+  mowgli_behavior::markCoverageStarted(loaded, 2);
+  loaded.cross_hatch[2].finish();
+  loaded.cross_hatch[2].finish();
+  EXPECT_FALSE(loaded.cross_hatch[2].next());
+  ASSERT_TRUE(clearCoverageResumeState(loaded));
+  EXPECT_TRUE(std::filesystem::exists(ctx.coverage_resume_path));
+  std::remove(ctx.coverage_resume_path.c_str());
+}
+
+TEST(CoveragePersistence, StoppedChargeHoldPersistsStopWithoutDroppingResumeCursor)
+{
+  BTContext cancelled;
+  cancelled.coverage_resume_path = ::testing::TempDir() + "/charge_hold_stop.txt";
+  cancelled.current_command = 8;  // COMMAND_STOP
+  cancelled.critical_charge_stop_latched = true;
+  cancelled.area_resume_pose_index[2] = 42;
+  cancelled.area_path_pose_count[2] = 100;
+  cancelled.area_plan_fingerprint[2] = 1234;
+
+  ASSERT_TRUE(saveCoverageResumeState(cancelled));
+
+  BTContext restarted;
+  restarted.coverage_resume_path = cancelled.coverage_resume_path;
+  ASSERT_TRUE(loadCoverageResumeState(restarted));
+  EXPECT_EQ(restarted.current_command, 8);
+  EXPECT_TRUE(restarted.critical_charge_stop_latched);
+  ASSERT_EQ(restarted.area_resume_pose_index.count(2), 1u);
+  EXPECT_EQ(restarted.area_resume_pose_index.at(2), 42u);
+
+  const bool auto_continue =
+      restarted.current_command == 1 &&
+      (!restarted.area_resume_pose_index.empty() || !restarted.completed_areas.empty());
+  EXPECT_FALSE(auto_continue);
+  std::remove(cancelled.coverage_resume_path.c_str());
+}
+
+TEST(CoveragePersistence, CriticalDockFailureRemainsLatchedAfterRestart)
+{
+  BTContext failed;
+  failed.coverage_resume_path = ::testing::TempDir() + "/critical_dock_failure.txt";
+  failed.current_command = 1;
+  failed.critical_dock_failure_latched = true;
+  ASSERT_TRUE(saveCoverageResumeState(failed));
+
+  BTContext restarted;
+  restarted.coverage_resume_path = failed.coverage_resume_path;
+  ASSERT_TRUE(loadCoverageResumeState(restarted));
+  EXPECT_TRUE(restarted.critical_dock_failure_latched);
+  EXPECT_EQ(restarted.current_command, 1);
+  std::remove(failed.coverage_resume_path.c_str());
+}
+
+TEST(CoveragePersistence, FailedPlanningCountsSessionsAndSurvivesRestart)
+{
+  BTContext ctx;
+  ctx.coverage_resume_path = ::testing::TempDir() + "/cross_hatch_failures.txt";
+  auto& state = ctx.cross_hatch[2];
+  state.next_perpendicular = true;
+  for (unsigned count = 1; count <= 3; ++count)
+  {
+    ASSERT_TRUE(state.begin(true));
+    state.planning_failed = true;
+    state.begin(true);  // retry is not a new failed session
+    state.finish();
+    state.finish();
+    EXPECT_EQ(state.failed_sessions, count);
+    EXPECT_TRUE(state.next());
+  }
+  ASSERT_TRUE(saveCoverageResumeState(ctx));
+  BTContext loaded;
+  loaded.coverage_resume_path = ctx.coverage_resume_path;
+  ASSERT_TRUE(loadCoverageResumeState(loaded));
+  ASSERT_EQ(loaded.cross_hatch.at(2).failed_sessions, 3u);
+  loaded.cross_hatch[2].begin(true);
+  mowgli_behavior::markCoverageStarted(loaded, 2);
+  EXPECT_EQ(loaded.cross_hatch[2].failed_sessions, 0u);
+  loaded.cross_hatch[2].finish();
+  EXPECT_FALSE(loaded.cross_hatch[2].next());
+  state.next_override = false;
+  state.finish();
+  EXPECT_EQ(state.failed_sessions, 0u);
+  EXPECT_FALSE(state.next());
+  std::remove(ctx.coverage_resume_path.c_str());
+}
 
 namespace
 {
@@ -82,6 +206,54 @@ TEST(CoveragePersistence, RoundTripsAllResumeState)
   std::remove(path.c_str());
 }
 
+// mowglinext#637 phase 2: the last-observed area id round-trips per index,
+// including an index that carries NO other resume-relevant state (only
+// cross-hatch history) — it must still get an id row so a later load can
+// detect the area list having changed since this file was written.
+TEST(CoveragePersistence, RoundTripsAreaIds)
+{
+  const std::string path = tempPath("coverage_resume_area_ids.txt");
+  std::remove(path.c_str());
+
+  BTContext saved;
+  seedContext(saved, path);
+  saved.area_ids[0] = 501;
+  saved.area_ids[2] = 502;
+  saved.area_ids[7] = 503;  // no other per-area state — cross-hatch only
+  saved.cross_hatch[7].begin(true);
+  ASSERT_TRUE(saveCoverageResumeState(saved));
+
+  BTContext loaded;
+  loaded.coverage_resume_path = path;
+  ASSERT_TRUE(loadCoverageResumeState(loaded));
+  EXPECT_EQ(loaded.area_ids[0], 501u);
+  EXPECT_EQ(loaded.area_ids[2], 502u);
+  EXPECT_EQ(loaded.area_ids[7], 503u);
+
+  std::remove(path.c_str());
+}
+
+// An index with no id ever recorded (0 — the "never observed" sentinel) must
+// not create a spurious ctx.area_ids entry: a real probe seeing an unrecorded
+// id must never be mistaken for "already observed and matching 0".
+TEST(CoveragePersistence, UnrecordedIdIsNotStoredAsZero)
+{
+  const std::string path = tempPath("coverage_resume_unrecorded_id.txt");
+  std::remove(path.c_str());
+
+  BTContext saved;
+  seedContext(saved, path);  // area 0 and 2 get rows; neither has an id set
+  ASSERT_TRUE(saveCoverageResumeState(saved));
+
+  BTContext loaded;
+  loaded.coverage_resume_path = path;
+  ASSERT_TRUE(loadCoverageResumeState(loaded));
+  EXPECT_EQ(loaded.area_ids.count(0u), 0u);
+  EXPECT_EQ(loaded.area_ids.count(2u), 0u);
+
+  std::remove(path.c_str());
+}
+
 TEST(CoveragePersistence, MissingFileLeavesContextUntouched)
 {
   BTContext ctx;
@@ -120,11 +292,11 @@ TEST(CoveragePersistence, MalformedRowIsSkippedNotFatal)
   const std::string path = tempPath("coverage_resume_partial.txt");
   {
     std::ofstream f(path, std::ios::trunc);
-    f << "mowgli_coverage_resume v2\n";
+    f << "mowgli_coverage_resume v3\n";
     f << "current_area 1\n";
     f << "area not_a_number garbage\n";  // malformed → skipped
-    // v2 row: area idx pose_count fingerprint resume completed ...
-    f << "area 1 2048 777 512 completed 0 1 2\n";  // valid → loaded
+    // v3 row: area idx id pose_count fingerprint resume completed ...
+    f << "area 1 555 2048 777 512 completed 0 1 2\n";  // valid → loaded
   }
   BTContext ctx;
   ctx.coverage_resume_path = path;
@@ -135,6 +307,29 @@ TEST(CoveragePersistence, MalformedRowIsSkippedNotFatal)
   EXPECT_EQ(ctx.area_plan_fingerprint[1], 777u);
   EXPECT_EQ(ctx.area_resume_pose_index[1], 512u);
   EXPECT_EQ(ctx.area_completed_swaths[1], (std::set<std::size_t>{0, 1, 2}));
+  EXPECT_EQ(ctx.area_ids[1], 555u);
+  std::remove(path.c_str());
+}
+
+// mowglinext#637 phase 2: the header bump is deliberately a hard break, not a
+// soft/optional column — an old v2 row parsed against the new column layout
+// would silently read the pose count into the id field and shift every field
+// after it. An old file must be rejected outright ("start fresh"), exactly
+// like any other unrecognised header.
+TEST(CoveragePersistence, OldVersionHeaderIsRejectedNotMisparsed)
+{
+  const std::string path = tempPath("coverage_resume_old_version.txt");
+  {
+    std::ofstream f(path, std::ios::trunc);
+    f << "mowgli_coverage_resume v2\n";
+    f << "current_area 1\n";
+    f << "area 1 2048 777 512 completed 0 1 2\n";  // valid v2 row
+  }
+  BTContext ctx;
+  ctx.coverage_resume_path = path;
+  EXPECT_FALSE(loadCoverageResumeState(ctx));
+  EXPECT_EQ(ctx.current_area, -1);  // unchanged — nothing parsed
+  EXPECT_TRUE(ctx.area_path_pose_count.empty());
   std::remove(path.c_str());
 }
 
@@ -153,6 +348,60 @@ TEST(CoveragePersistence, ClearRemovesFile)
   BTContext reloaded;
   reloaded.coverage_resume_path = path;
   EXPECT_FALSE(loadCoverageResumeState(reloaded));
+}
+
+TEST(CoveragePersistence, FailedPhaseWriteCannotRestoreAnEndedSession)
+{
+  for (bool enabled : {false, true})
+  {
+    const auto path = tempPath(enabled ? "clear_phase_enabled.txt" : "clear_phase_disabled.txt");
+    BTContext ctx;
+    seedContext(ctx, path);
+    ctx.current_command = 1;  // COMMAND_START with resumable progress
+    ctx.single_area_target = 2;
+    ctx.cross_hatch[2].begin(enabled);  // also populated when cross-hatch is disabled
+    ctx.cross_hatch[2].used = true;
+    ASSERT_TRUE(saveCoverageResumeState(ctx));
+    ctx.cross_hatch[2].finish();
+
+    // Force the phase-only replacement to fail to open. The old snapshot is
+    // still readable/removable; clearing safety state must not depend on a write.
+    const auto tmp = path + ".tmp";
+    ASSERT_TRUE(std::filesystem::create_directory(tmp));
+    EXPECT_FALSE(clearCoverageResumeState(ctx));  // report the lost metadata
+    EXPECT_TRUE(std::filesystem::remove(tmp));
+
+    BTContext restarted;
+    restarted.coverage_resume_path = path;
+    EXPECT_FALSE(loadCoverageResumeState(restarted));
+    EXPECT_EQ(restarted.current_command, 0);
+    EXPECT_TRUE(restarted.area_resume_pose_index.empty());
+    EXPECT_TRUE(restarted.completed_areas.empty());
+    EXPECT_FALSE(restarted.single_area_target.has_value());
+    const bool auto_continue =
+        restarted.current_command == 1 &&
+        (!restarted.area_resume_pose_index.empty() || !restarted.completed_areas.empty());
+    EXPECT_FALSE(auto_continue);
+    std::remove(path.c_str());
+  }
+}
+
+TEST(CoveragePersistence, ClearReportsRemovalFailure)
+{
+  // A non-empty directory cannot be removed as a resume file. Unlike ENOENT,
+  // this must be reported as a failure, even without cross-hatch metadata.
+  const auto path = tempPath("clear_resume_remove_failure");
+  ASSERT_TRUE(std::filesystem::create_directory(path));
+  const auto child = path + "/keep";
+  {
+    std::ofstream file(child);
+  }
+  BTContext ctx;
+  ctx.coverage_resume_path = path;
+  EXPECT_FALSE(clearCoverageResumeState(ctx));
+  EXPECT_TRUE(std::filesystem::remove(child));
+  EXPECT_TRUE(std::filesystem::remove(path));
+  EXPECT_TRUE(clearCoverageResumeState(ctx));  // absent is already clear
 }
 
 TEST(CoveragePersistence, RoundTripsCurrentCommand)
@@ -186,9 +435,9 @@ TEST(CoveragePersistence, AbsentCurrentCommandDefaultsToIdle)
   const std::string path = tempPath("coverage_resume_no_command.txt");
   {
     std::ofstream f(path, std::ios::trunc);
-    f << "mowgli_coverage_resume v2\n";
+    f << "mowgli_coverage_resume v3\n";
     f << "current_area 0\n";
-    f << "area 0 1000 5 512 completed 0 1\n";  // resumable, but no command line
+    f << "area 0 900 1000 5 512 completed 0 1\n";  // resumable, but no command line
   }
   BTContext ctx;
   ctx.coverage_resume_path = path;
@@ -210,6 +459,11 @@ TEST(CoveragePersistence, RoundTripsSingleAreaTarget)
   seedContext(saved, path);
   saved.current_command = 1;
   saved.single_area_target = 3u;
+  // mowglinext#637: the id it was locked in against must survive the same
+  // restart, or the very next probe after reboot would have nothing to
+  // verify the target against and silently re-lock onto whatever is at
+  // index 3 by then.
+  saved.single_area_target_id = 42u;
   ASSERT_TRUE(saveCoverageResumeState(saved));
 
   BTContext loaded;
@@ -217,6 +471,32 @@ TEST(CoveragePersistence, RoundTripsSingleAreaTarget)
   ASSERT_TRUE(loadCoverageResumeState(loaded));
   ASSERT_TRUE(loaded.single_area_target.has_value());
   EXPECT_EQ(*loaded.single_area_target, 3u);
+  ASSERT_TRUE(loaded.single_area_target_id.has_value());
+  EXPECT_EQ(*loaded.single_area_target_id, 42u);
+
+  std::remove(path.c_str());
+}
+
+// A targeted run whose very first dispatch never got a probe response before
+// a restart has a target index but no locked-in id yet — that must read back
+// as "not yet locked in" (so the next probe locks it in fresh), not as a
+// spurious mismatch against nothing.
+TEST(CoveragePersistence, SingleAreaTargetWithoutIdMeansNotYetLockedIn)
+{
+  const std::string path = tempPath("coverage_resume_single_area_no_id.txt");
+  std::remove(path.c_str());
+
+  BTContext saved;
+  seedContext(saved, path);
+  saved.current_command = 1;
+  saved.single_area_target = 2u;
+  ASSERT_TRUE(saveCoverageResumeState(saved));
+
+  BTContext loaded;
+  loaded.coverage_resume_path = path;
+  ASSERT_TRUE(loadCoverageResumeState(loaded));
+  ASSERT_TRUE(loaded.single_area_target.has_value());
+  EXPECT_FALSE(loaded.single_area_target_id.has_value());
 
   std::remove(path.c_str());
 }
@@ -245,4 +525,102 @@ int main(int argc, char** argv)
 {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST(CoveragePersistence, CrossHatchSurvivesRestartAndAdvancesOnlyAtSessionEnd)
+{
+  const auto path = tempPath("cross_hatch_resume.txt");
+  std::remove(path.c_str());
+  BTContext ctx;
+  ctx.coverage_resume_path = path;
+  EXPECT_FALSE(ctx.cross_hatch[0].begin(true));
+  ctx.cross_hatch[0].used = true;
+  ctx.current_command = 1;
+  ctx.area_resume_pose_index[0] = 42;
+  ASSERT_TRUE(saveCoverageResumeState(ctx));
+
+  BTContext restored;
+  restored.coverage_resume_path = path;
+  ASSERT_TRUE(loadCoverageResumeState(restored));
+  EXPECT_FALSE(restored.cross_hatch[0].begin(true));
+  EXPECT_EQ(restored.area_resume_pose_index[0], 42u);
+  // A clear-progress request preserves the current phase without a cursor.
+  ASSERT_TRUE(clearCoverageResumeState(restored));
+  BTContext cleared;
+  cleared.coverage_resume_path = path;
+  ASSERT_TRUE(loadCoverageResumeState(cleared));
+  EXPECT_EQ(cleared.current_command, 0u);
+  EXPECT_TRUE(cleared.area_resume_pose_index.empty());
+  EXPECT_FALSE(cleared.cross_hatch[0].begin(true));
+
+  restored.cross_hatch[0].finish();
+  ASSERT_TRUE(clearCoverageResumeState(restored));
+  BTContext next;
+  next.coverage_resume_path = path;
+  ASSERT_TRUE(loadCoverageResumeState(next));
+  EXPECT_EQ(next.current_command, 0u);  // phase history must never auto-start
+  EXPECT_TRUE(next.area_resume_pose_index.empty());
+  EXPECT_TRUE(next.cross_hatch[0].begin(true));
+  EXPECT_TRUE(
+      next.cross_hatch[0].begin(false));  // configuration change cannot rotate a live session
+  next.cross_hatch[0].used = true;
+  next.cross_hatch[0].finish();
+  ASSERT_TRUE(clearCoverageResumeState(next));
+  BTContext third;
+  third.coverage_resume_path = path;
+  loadCoverageResumeState(third);
+  EXPECT_FALSE(third.cross_hatch[0].begin(true));
+  std::remove(path.c_str());
+}
+
+TEST(CoveragePersistence, CrossHatchDoesNotAdvanceForUnusedOrDisabledSessions)
+{
+  mowgli_behavior::CrossHatch state;
+  EXPECT_FALSE(state.begin(true));
+  state.finish();  // planning failed; no coverage started
+  EXPECT_FALSE(state.begin(true));
+  state.used = true;
+  state.finish();
+  state.finish();  // repeated EndSession is harmless
+  EXPECT_FALSE(state.begin(false));
+  state.used = true;
+  state.finish();
+  EXPECT_TRUE(state.begin(true));  // disabled run did not consume the next phase
+}
+
+TEST(CoveragePersistence, MalformedCrossHatchStateIsIgnored)
+{
+  const auto path = tempPath("cross_hatch_corrupt.txt");
+  {
+    std::ofstream out(path);
+    out << "mowgli_coverage_resume v3\ncross_hatch_area 0 1 5 1 1 -1\n";
+  }
+  BTContext ctx;
+  ctx.coverage_resume_path = path;
+  ASSERT_TRUE(loadCoverageResumeState(ctx));
+  EXPECT_FALSE(ctx.cross_hatch[0].begin(true));
+  std::remove(path.c_str());
+}
+
+TEST(CoveragePersistence, AreasAndNextOverridesRoundTripIndependently)
+{
+  BTContext ctx;
+  ctx.coverage_resume_path = tempPath("cross_hatch_areas.txt");
+  ctx.cross_hatch[0].begin(true);
+  ctx.cross_hatch[0].used = true;
+  ctx.cross_hatch[2].next_override = true;
+  ASSERT_TRUE(saveCoverageResumeState(ctx));
+  BTContext restored;
+  restored.coverage_resume_path = ctx.coverage_resume_path;
+  ASSERT_TRUE(loadCoverageResumeState(restored));
+  EXPECT_FALSE(restored.cross_hatch[0].begin(true));
+  EXPECT_TRUE(restored.cross_hatch[0].next());
+  EXPECT_TRUE(restored.cross_hatch[2].begin(true));
+  EXPECT_FALSE(restored.cross_hatch[1].begin(true));
+  // An override during an active run affects NEXT, not CURRENT, and survives end.
+  restored.cross_hatch[0].next_override = false;
+  EXPECT_FALSE(restored.cross_hatch[0].begin(true));
+  restored.cross_hatch[0].finish();
+  EXPECT_FALSE(restored.cross_hatch[0].begin(true));
+  std::remove(ctx.coverage_resume_path.c_str());
 }

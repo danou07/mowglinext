@@ -3,7 +3,7 @@ import {useMatches, useNavigate, useOutlet} from "react-router-dom";
 import {AnimatePresence, motion, LayoutGroup} from "framer-motion";
 import {
   Home, Map as MapIcon, Calendar, Compass, Settings, Terminal, Rocket, Activity,
-  MoreHorizontal, X, SlidersHorizontal,
+  MoreHorizontal, X, Users,
 } from "lucide-react";
 
 import {useTranslation} from "react-i18next";
@@ -18,6 +18,7 @@ import {useAutoNotifications} from "../hooks/useNotificationCenter.tsx";
 import {useHighLevelStatus} from "../hooks/useHighLevelStatus.ts";
 import {useEmergency} from "../hooks/useEmergency.ts";
 import {useStatus} from "../hooks/useStatus.ts";
+import {useHostUpdater} from "../hooks/useHostUpdater";
 import {useIsMobile} from "../hooks/useIsMobile";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 import {BRAND_GRADIENT} from "../theme/colors.ts";
@@ -49,10 +50,10 @@ const NAV: NavItem[] = [
   {key: '/schedule',    labelKey: 'nav.schedule',    shortLabelKey: 'nav.schedule',  icon: Calendar, showInBottom: true},
   {key: '/diagnostics', labelKey: 'nav.diagnostics', shortLabelKey: 'nav.diagShort', icon: Activity, showInBottom: true},
   {key: '/statistics',  labelKey: 'nav.stats',                                        icon: Compass,  showInBottom: false},
+  {key: '/fleet',       labelKey: 'nav.fleet',                                        icon: Users,    showInBottom: false},
   {key: '/settings',    labelKey: 'nav.settings',                                     icon: Settings, showInBottom: false},
-  {key: '/parameters',  labelKey: 'nav.parameters',                                   icon: SlidersHorizontal, showInBottom: false},
   {key: '/logs',        labelKey: 'nav.logs',                                         icon: Terminal, showInBottom: false},
-  {key: '/onboarding',  labelKey: 'nav.onboarding',                                   icon: Rocket,   showInBottom: false},
+  {key: '/onboarding',  labelKey: 'nav.onboarding', shortLabelKey: 'nav.setupShort',                                   icon: Rocket,   showInBottom: false},
 ];
 
 // Title falls back to the nav label key where they coincide; statistics has a
@@ -63,8 +64,8 @@ const PAGE_META: Record<string, {titleKey: string; subtitleKey?: string}> = {
   '/schedule':    {titleKey: 'nav.schedule',             subtitleKey: 'pageMeta.schedule.subtitle'},
   '/diagnostics': {titleKey: 'nav.diagnostics',          subtitleKey: 'pageMeta.diagnostics.subtitle'},
   '/statistics':  {titleKey: 'pageMeta.statistics.title', subtitleKey: 'pageMeta.statistics.subtitle'},
+  '/fleet':       {titleKey: 'nav.fleet',                subtitleKey: 'pageMeta.fleet.subtitle'},
   '/settings':    {titleKey: 'nav.settings',             subtitleKey: 'pageMeta.settings.subtitle'},
-  '/parameters':  {titleKey: 'nav.parameters',           subtitleKey: 'pageMeta.parameters.subtitle'},
   '/logs':        {titleKey: 'nav.logs',                 subtitleKey: 'pageMeta.logs.subtitle'},
   '/onboarding':  {titleKey: 'nav.onboarding'},
 };
@@ -133,15 +134,17 @@ export function AppShell() {
     return (
       <div data-concept style={{
         display: 'flex', flexDirection: 'column',
-        height: '100%', background: colors.bgBase, overflow: 'hidden',
+        // The frame never scrolls; only main does. Unlike hidden, clip also
+        // prevents focused selects from shifting this frame horizontally.
+        height: '100%', background: colors.bgBase, overflow: 'clip',
       }}>
         <style>{KEYFRAMES_CSS}</style>
         <AuroraBackdrop/>
         <LiveStatusStrip/>
 
         <header style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: '0 16px',
+          display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between',
+          padding: '0 16px 6px',
           paddingTop: 'max(env(safe-area-inset-top, 0px), 6px)',
           minHeight: 56,
           background: 'rgba(2, 17, 13, 0.94)',
@@ -165,8 +168,8 @@ export function AppShell() {
           <div style={{display: 'flex', alignItems: 'center', gap: 6}}>
             <LanguageSwitcher/>
             <NotificationBell/>
-            <MowerStatus/>
           </div>
+          <div style={{width:'100%', display:'flex', justifyContent:'flex-end', marginTop:4}}><MowerStatus/></div>
         </header>
 
         <main style={{
@@ -313,6 +316,7 @@ interface RailProps {
 
 function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
   const {t} = useTranslation();
+  const navigate = useNavigate();
   return (
     <aside style={{
       position: 'fixed', top: 0, bottom: 0, left: 0, width: 88,
@@ -346,7 +350,7 @@ function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
 
       <LayoutGroup>
         <nav style={{display: 'flex', flexDirection: 'column', gap: 4, padding: '0 12px', flex: 1, overflowY: 'auto'}}>
-          {items.map(({key, labelKey, icon: Icon}) => {
+          {items.map(({key, labelKey, shortLabelKey, icon: Icon}) => {
             const isActive = key === activePath;
             return (
               <button
@@ -383,14 +387,33 @@ function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
                   />
                 )}
                 <Icon size={18} strokeWidth={isActive ? 2.4 : 2}/>
-                <span>{t(labelKey)}</span>
+                <span title={t(labelKey)} style={{maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{t(shortLabelKey ?? labelKey)}</span>
               </button>
             );
           })}
         </nav>
       </LayoutGroup>
+      <RunningVersionSummary onClick={() => void navigate('/settings?section=updates')}/>
     </aside>
   );
+}
+
+// The footer describes the verified running release, never the update target.
+function RunningVersionSummary({onClick, mobile = false}: {onClick: () => void; mobile?: boolean}) {
+  const {t} = useTranslation();
+  const {data, error} = useHostUpdater();
+  const active = data?.state.active;
+  const matched = !error && data?.runtime?.identity === 'matched' && active;
+  const version = matched ? (active.source.track === 'stable' ? active.release_tag || active.id : active.revision.slice(0, 8))
+    : t(!error && ['mixed', 'custom', 'drifted'].includes(data?.runtime?.identity ?? '') ? 'hostUpdater.summaryCustom' : 'hostUpdater.summaryUnknown');
+  const track = matched ? (active.source.track === 'custom' ? active.source.branch : t(`hostUpdater.tracks.${active.source.track}`)) : t('hostUpdater.installed');
+  const description = t('hostUpdater.runningSummary', {version, track});
+  return <button data-testid="running-version-summary" onClick={onClick} aria-label={description} title={description} style={{
+    display:'flex', flexDirection:mobile ? 'row' : 'column', alignItems:'center', justifyContent:'center', gap:5,
+    margin:mobile ? 0 : '12px 8px 0', padding:'12px 2px', minHeight:48, gridColumn:'1 / -1',
+    background:'transparent', border:'none', borderTop:'1px solid rgba(236,255,244,0.1)',
+    color:'#7CFFB2', cursor:'pointer', minWidth:0,
+  }}><span style={{fontSize:12, fontWeight:700}}>{version}</span><span style={{fontSize:10, color:'rgba(236,255,244,0.75)', maxWidth:'100%', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{track}</span></button>;
 }
 
 // ─── Mobile bottom nav ───
@@ -482,6 +505,7 @@ interface MoreSheetProps {
 
 function MobileMoreSheet({open, items, activePath, onClose, onNavigate}: MoreSheetProps) {
   const {t} = useTranslation();
+  const navigate = useNavigate();
   const {displayMode} = useThemeMode();
 
   // Escape closes the sheet (keyboard parity with the backdrop tap / X button).
@@ -526,7 +550,7 @@ function MobileMoreSheet({open, items, activePath, onClose, onNavigate}: MoreShe
               </button>
             </div>
             <div style={{display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10}}>
-              {items.map(({key, labelKey, icon: Icon}) => {
+              {items.map(({key, labelKey, shortLabelKey, icon: Icon}) => {
                 const isActive = key === activePath;
                 return (
                   <button key={key} onClick={() => onNavigate(key)} style={{
@@ -538,10 +562,12 @@ function MobileMoreSheet({open, items, activePath, onClose, onNavigate}: MoreShe
                     fontSize: 14, fontWeight: 600,
                   }}>
                     <Icon size={20}/>
-                    <span>{t(labelKey)}</span>
+                    <span title={t(labelKey)} style={{maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{t(shortLabelKey ?? labelKey)}</span>
                   </button>
                 );
               })}
+              <RunningVersionSummary mobile onClick={() => { onClose(); void navigate('/settings?section=updates'); }}/>
+
             </div>
           </motion.div>
         </>

@@ -8,9 +8,11 @@
 package main
 
 import (
+	"log"
+
+	"github.com/joho/godotenv"
 	"github.com/mowglinext/mowglinext/pkg/api"
 	"github.com/mowglinext/mowglinext/pkg/providers"
-	"github.com/joho/godotenv"
 )
 
 func main() {
@@ -35,6 +37,21 @@ func main() {
 		providers.NewMqttProvider(rosProvider, dbProvider)
 	}
 	irriSenseProvider := providers.NewIrriSenseProvider(dbProvider)
+	remoteAccessProvider := providers.NewRemoteAccessProvider(dbProvider, dockerProvider)
 	providers.NewSchedulerProvider(rosProvider, dbProvider, irriSenseProvider)
-	api.NewAPI(dbProvider, dockerProvider, rosProvider, firmwareProvider, irriSenseProvider)
+	// Mirrors the schedules onto the same external broker mqtt_bridge_node uses
+	// (docs/MQTT_CONTROL.md), gated by the same mqtt_enabled switch; inert when
+	// MQTT is off. Deliberately independent of the "system.mqtt.enabled"/
+	// NewMqttProvider above -- that is the GUI's own embedded broker for an
+	// unrelated purpose, not the robot's documented external MQTT contract.
+	api.NewScheduleMqttBridge(dbProvider)
+	notificationProvider := providers.NewNotificationProvider(dbProvider)
+	if ros, ok := rosProvider.(*providers.RosProvider); ok {
+		ros.AttachNotifier(notificationProvider)
+	} else {
+		log.Printf("notifications: ROS provider %T cannot feed status events", rosProvider)
+	}
+	fleetProvider := providers.NewFleetProvider(dbProvider, rosProvider)
+	fleetCoordinator := providers.NewFleetCoordinator(dbProvider, rosProvider, fleetProvider)
+	api.NewAPI(dbProvider, dockerProvider, rosProvider, firmwareProvider, irriSenseProvider, remoteAccessProvider, notificationProvider, fleetProvider, fleetCoordinator)
 }

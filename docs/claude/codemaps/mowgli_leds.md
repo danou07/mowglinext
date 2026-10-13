@@ -17,6 +17,7 @@
 | Change mode priority / what beats what | `led_pattern.hpp` `SelectMode()` (l.241-275); pinned by `test/test_led_pattern.cpp` `LedPatternMode.*` (l.58-143) |
 | Add a new `HIGH_LEVEL_STATE_*` | `led_pattern.hpp` `HighLevelState` enum (l.80-87) + `led_ring_node.cpp` `static_assert`s (l.22-36) + `ToHighLevelState()` (l.42-57) + `SelectMode` switch (l.262-274) |
 | Change staleness / source precedence (BT vs Power vs GNSS) | `led_ring_node.cpp` `collectInputs()` (l.191-218) |
+| Transit mode (`kTransit`) signal source | `HighLevelStatus.sub_state_name == "TRANSIT"`, set LIVE (not by `PublishHighLevelStatus`, which does not re-tick while `FollowStrip` runs) by `withLiveStatusFields` in `mowgli_behavior/status_snapshot.cpp` from `BTContext::transiting` (refreshed every `FollowStrip::onRunning()` tick in `coverage_nodes.cpp`); consumed into `LedInputs::transiting` in `led_ring_node.cpp` `collectInputs()`, gated on `status_fresh` |
 | Change device open / retry / warn-once policy | `led_ring_node.cpp` `ensureDevice()` (l.220-260), `writeFrame()` (l.262-301) |
 | Change SPI mode, bits-per-word, ioctls | `ros2/src/mowgli_leds/src/spi_device.cpp` `Open()` (l.50-105) |
 | Change bit timing / SPI clock / symbol table | `ros2/src/mowgli_leds/include/mowgli_leds/ws2812_encoder.hpp` `kSpiClockHz` (l.74), `ExpandByte()` (l.101-114); header comment l.16-36 explains why 3 bits @ 2.4 MHz |
@@ -50,6 +51,8 @@
 | `ros2/src/mowgli_leds/src/spi_device.cpp` | 135 | Only hardware-touching code: `open`/`ioctl`(mode 0, 8 bpw, MSB, speed)/`write`; `#ifdef __linux__` |
 | `ros2/src/mowgli_leds/src/led_ring_main.cpp` | 18 | `main()`: `rclcpp::spin(LedRingNode)` |
 | `ros2/src/mowgli_leds/test/test_led_pattern.cpp` | ~510 | 36 gtests: mode priority, arc arithmetic, animation helpers, rendered frames per mode |
+| `ros2/src/mowgli_leds/include/mowgli_leds/indicator_ids.hpp` | ~50 | Header-only `ParseIndicatorIds()` for `led_charge_complete_indicator_ids` (comma list, malformed tokens skipped one by one) |
+| `ros2/src/mowgli_leds/test/test_indicator_ids.cpp` | ~45 | 3 gtests: whitespace/order, blank input, malformed/negative/overflow tokens dropped individually |
 | `ros2/src/mowgli_leds/test/test_ws2812_encoder.cpp` | 181 | 13 gtests: symbol expansion, MSB-first, GRB order, frame size, reset gap, clock, brightness |
 | **Integration points outside the package** | | |
 | `ros2/src/mowgli_bringup/launch/full_system.launch.py` | 742 | Launches `led_ring_node` (l.668-706) under `IfCondition(led_enabled)`; passes every `led_*` from merged config |
@@ -87,7 +90,7 @@ Freshness: every source is stale after `led_status_timeout_s` (`collectInputs()`
 None.
 
 ### Parameters
-All 14 declared in the constructor (`led_ring_node.cpp:65-83`), read **once at startup** (no parameter callback). Defaults live in the template `ros2/src/mowgli_bringup/config/mowgli_robot.yaml` and are mirrored in `gui/asserts/mower_config.schema.json`; `full_system.launch.py` forwards them with matching fallbacks.
+All 17 declared in the constructor (`led_ring_node.cpp:65-83`), read **once at startup** (no parameter callback). Defaults live in the template `ros2/src/mowgli_bringup/config/mowgli_robot.yaml` and are mirrored in `gui/asserts/mower_config.schema.json`; `full_system.launch.py` forwards them with matching fallbacks.
 
 | Param | Default | Node clamp (file:line) | Effect |
 |-------|---------|------------------------|--------|
@@ -105,6 +108,9 @@ All 14 declared in the constructor (`led_ring_node.cpp:65-83`), read **once at s
 | `led_idle_scale` | `0.10` | `[0, 1]` (l.111) | Idle ring dim factor |
 | `led_charge_complete_timeout_s` | `600.0` | `≥ 0` (0 = disabled) | Seconds of steady full-green before dimming (`LedRingNode::updateChargeCompleteTracking`) |
 | `led_charge_complete_dim_scale` | `0.0` | `[0, 1]` | Brightness once the timeout above elapses; 0 = off |
+| `led_charge_complete_indicator_count` | `0` | `≥ 0` (clamped to `led_count` at render) | Pixels, evenly spaced, kept at `led_charge_complete_indicator_scale` instead of dimming; 0 = off. Ignored when `led_charge_complete_indicator_ids` is non-empty |
+| `led_charge_complete_indicator_scale` | `0.15` | `[0, 1]` | Brightness of the indicator pixels above |
+| `led_charge_complete_indicator_ids` | `""` | parsed by `ParseIndicatorIds` (`led_ring_node.cpp`) | Comma-separated exact pixel indices, e.g. `"0,4,8,12"`, taking priority over `led_charge_complete_indicator_count` when non-empty. A string, not a native ROS2 array — an empty YAML list can't be type-inferred (same gotcha as `mowgli_map`'s `area_names`) |
 
 `use_sim_time` is also passed by launch (l.676) but has no effect: animations use `std::chrono::steady_clock` (`monotonicSeconds()` l.185-189) and the tick is a wall timer.
 
@@ -119,6 +125,7 @@ None (no TF publish or lookup).
 | 3 | `kStale` | `!status_fresh` | `kAmber` comet, 1.5 s/rev |
 | 4 | `kLowBattery` | `battery_valid && battery_percent < low_battery_percent` | whole ring `kRed` blink 1 Hz |
 | 5 | `kMowing` / `kMowingDegraded` | `kAutonomous` + `rtk_fixed` / not | green arc + white head / amber arc + 2 Hz blinking head |
+| 5.5 | `kTransit` | `kAutonomous` + `transiting` (outranks Mowing/Degraded inside the same branch) | `kLightOrange`, ring halves alternate lit/dark ~1 s each (`led_count / 2` — not hardcoded) |
 | 6 | `kRecording` | `kRecording` | `kCyan` comet 2 s/rev |
 | 7 | `kManual` | `kManualMowing` | `kPurple` breathing 2 s |
 | 8 | `kIdle` | `kIdle` / `kNull` / default | `Dim(kWhite, idle_scale)` |
@@ -140,6 +147,7 @@ Lint: `ament_lint_auto` with copyright/cpplint/uncrustify suppressed (`CMakeList
 | Test | Registered in | Pins |
 |------|---------------|------|
 | `ros2/src/mowgli_leds/test/test_led_pattern.cpp` (36 cases) | `CMakeLists.txt:103-108` `ament_add_gtest(test_led_pattern)` | Mode priority (emergency > charging > stale > low-battery > activity; stale emergency ignored), `FilledCount` end rules, `Breathe`/`BlinkOn`/`RotationIndex` bounds + negative time, exact rendered frames per mode, zero-length ring, charge-complete dim timeout (below timeout stays full green, at/after timeout dims, non-zero dim scale, timeout=0 disables) |
+| `ros2/src/mowgli_leds/test/test_indicator_ids.cpp` (3 cases) | `CMakeLists.txt` `ament_add_gtest(test_indicator_ids)` | `ParseIndicatorIds`: whitespace + order kept, empty/blank/commas-only → no IDs, negative / alpha / trailing-garbage / float / hex / overflow tokens skipped individually with valid neighbours kept |
 | `ros2/src/mowgli_leds/test/test_ws2812_encoder.cpp` (13 cases) | `CMakeLists.txt:96-101` `ament_add_gtest(test_ws2812_encoder)` | `0→0b100`, `1→0b110`, MSB-first, every symbol starts high/ends low, GRB order, 9 bytes/pixel + reset gap, gap ≥ 280 µs of zeros, 3 bits @ 2.4 MHz = 1.25 µs, brightness linear/clamped/NaN-safe, empty buffer still emits the gap |
 | `gui/pkg/api/settings_leds_test.go` | `cd gui && go test ./pkg/api/...` | `led_enabled` schema default `false` + `sparsifyFlat` round-trip; every `led_*` schema default == template value and no extra `led_*` in schema; `3 / led_spi_speed_hz == 1.25 µs` |
 | `gui/web/src/components/settings/LedsSection.test.tsx` (14 cases) | `cd gui/web && yarn test` | Absent key renders OFF, controls hidden until enabled, ON writes `true` / OFF writes `false`, overlay + `ls /dev/spidev*` hint, 3.3 V warning, hardware + appearance field sets, count/device edits, legend lists every mode, two reds differ by motion, reset-to-default, no-defaults render |

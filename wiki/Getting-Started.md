@@ -4,6 +4,8 @@
 
 ## Hardware
 
+> **Building the robot?** The illustrated, step-by-step **[build manual](https://mowgli.garden/build/)** (EN/FR) covers parts, wiring, the compute board, IMU, RTK GNSS, LiDAR, firmware flashing, the installer and the first mow. This page is the reference summary.
+
 ### Compute Board
 
 Any 64-bit Linux board with Docker support (the installer supports `arm64` and `amd64`):
@@ -58,7 +60,7 @@ The fastest way to explore and develop MowgliNext — no local setup required:
 
 ### What's included
 
-The devcontainer provides a complete ROS2 Kilted development environment:
+The devcontainer provides a complete ROS2 Lyrical development environment:
 
 - Full Nav2 navigation stack plus GTSAM 4.3a1, for the `fusion_graph` factor-graph localizer — the stack's sole localizer, with an optional persistent LiDAR map anchor for complete GNSS outages
 - Nav2 controller plugins as the stack uses them: `mowgli_nav2_plugins/FTCController` follows the coverage path, RotationShim + Regulated Pure Pursuit handle transit
@@ -68,7 +70,7 @@ The devcontainer provides a complete ROS2 Kilted development environment:
 - Claude Code CLI + GitHub CLI for AI-assisted development
 - Auto-sourced ROS2 workspace
 
-Two things the devcontainer deliberately does **not** carry: the Webots simulator (see [Run the simulation](#run-the-simulation) below), and Fields2Cover v3. The image builds Fields2Cover 2.0.0 into `/opt/fields2cover-200`, while `mowgli_coverage` pins Fields2Cover 3.0.0 at `/opt/fields2cover-300` — which only the full `ros2/Dockerfile` build provides. Build the focused development set in the devcontainer rather than the whole workspace.
+The devcontainer builds Fields2Cover v3 and the pinned Lyrical source dependencies. Webots itself remains in the dedicated simulation image (see [Run the simulation](#run-the-simulation) below).
 
 **Forwarded ports:**
 
@@ -105,25 +107,41 @@ Foxglove Studio then connects to `ws://localhost:8765`; the noVNC view of the si
 
 ## Quick Start on Hardware (Automated)
 
-The easiest way to deploy on real hardware is the install composer at [mowgli.garden](https://mowgli.garden/#getting-started). Pick your hardware (GPS, LiDAR, rangefinders) and copy the generated command. Or run the installer directly:
+The easiest way to deploy on real hardware is the install composer at [mowgli.garden](https://mowgli.garden/#getting-started). Pick your hardware (backend, GNSS link, LiDAR) and copy the generated command — it runs **non-interactively**: every choice it does not list takes its documented default. Or run the installer directly and answer the prompts:
 
 ```bash
 curl -sSL https://mowgli.garden/install.sh | bash
 ```
 
-The installer handles:
+The installer only wires the **host**:
 - Docker installation (if needed)
-- udev rules for serial devices (`/dev/mowgli`, `/dev/gps`, `/dev/lidar`)
-- Sensor configuration (pre-filled if you used the web composer, interactive otherwise)
-- Mower configuration (GPS datum, dock position, NTRIP credentials)
-- Pulling and launching all containers
-- Post-install diagnostics
+- udev rules for serial devices (`/dev/mowgli`, `/dev/gps`, `/dev/lidar`), UART overlays, DDS sysctl
+- `docker/.env`, the merged compose file and the sparse `mowgli_robot.yaml` seed (hardware keys only)
+- the `mowgli-*` helper commands, the host updater service, then pulls and starts the containers
 
-Run diagnostics on an existing installation:
+Datum, NTRIP, the GNSS receiver profile and LiDAR mounting are **not** asked: the GUI onboarding wizard configures them after the first start.
+
+The same script has four modes, all run from the checkout:
 
 ```bash
-cd ~/mowglinext/install && ./mowglinext.sh --check
+cd ~/mowglinext/install
+./mowglinext.sh check                 # diagnostics only
+./mowglinext.sh update                # manual update: sync the checkout, regenerate .env/compose, pull, restart
+./mowglinext.sh update --branch=dev   # ...onto another branch/image channel
+./mowglinext.sh repair                # re-apply udev/UART/sysctl/.env/compose/helpers from the saved choices, no prompts
+./mowglinext.sh install --non-interactive --backend=mowgli --gnss-connection=uart --lidar=ldlidar-uart
+./mowglinext.sh uninstall             # remove everything; keeps the maps volume and mowgli_robot.yaml for a later reinstall
 ```
+
+`update` is deliberately independent of the host updater (Settings > Updates): no readiness gate, no firmware-protocol check, no backup/rollback transaction — it is the escape hatch when the updater cannot or must not run. It regenerates the runtime files with the same writers as `install`, so an installed updater can adopt the result afterwards.
+
+Add or re-run a single step on an already-installed robot, instead of repeating the whole flow — e.g. install the host auto-updater afterwards:
+
+```bash
+./mowglinext.sh --only=updater
+```
+
+Valid step names: `docker`, `backend`, `gps`, `lidar`, `uart`, `directory`, `migrate`, `env`, `udev`, `mower`, `helpers`, `updater`, `startup`, `system` (run with any other name to have the installer print this list). `--only=` skips the branch/language prompts and reuses your existing configuration.
 
 ## Manual Install
 

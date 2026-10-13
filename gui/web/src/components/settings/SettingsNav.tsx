@@ -6,6 +6,7 @@ import {
     BgColorsOutlined,
     BulbOutlined,
     CloudOutlined,
+    BellOutlined,
     CloudSyncOutlined,
     CodeOutlined,
     CompassOutlined,
@@ -41,6 +42,7 @@ const SECTION_ICONS: Record<string, React.ReactNode> = {
     compass: <CompassOutlined />,
     cloud: <CloudOutlined />,
     "cloud-sync": <CloudSyncOutlined />,
+    bell: <BellOutlined />,
     code: <CodeOutlined />,
 };
 
@@ -96,8 +98,8 @@ export const SettingsNav: React.FC<Props> = ({
                 key: section.id,
                 icon: SECTION_ICONS[section.icon],
                 label: (
-                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        {t(section.label)}
+                    <span title={t(section.label)} style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                        <span style={{overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap"}}>{t(section.label)}</span>
                         {isSectionDirty(section.id) && (
                             <span
                                 style={{

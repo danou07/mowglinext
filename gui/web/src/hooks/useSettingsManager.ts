@@ -6,7 +6,22 @@ import { dirtyKeysRequireGpsRestart, restartGps } from "../utils/containers.ts";
 import { useContainerRestart } from "./useContainerRestart.ts";
 import { getQuaternionFromHeading } from "../utils/map.tsx";
 import { ContentType } from "../api/Api.ts";
+import {matchesSettingSearch, settingSearchText} from "../utils/settingsSearch.ts";
 import { valuesMatch } from "../utils/settingsValues.ts";
+import {
+    AREA_RECORDING_GROUP,
+    BEHAVIOR_TREE_GROUP,
+    CHARGE_LIMITS_GROUP,
+    DOCK_CALIBRATION_GROUP,
+    DOCK_DETECTION_GROUP,
+    FIRMWARE_SAFETY_GROUP,
+    LOCALIZATION_GUARD_GROUP,
+    REVERSE_ESCAPE_GROUP,
+    START_ESCAPE_GROUP,
+    TURN_SPEED_GROUP,
+    YAW_LOOP_GROUP,
+    groupKeys,
+} from "../components/settings/settingsFieldGroups.ts";
 
 /** A section that saves outside mowgli_robot.yaml but wants the page's Save button. */
 export interface ExternalSaver {
@@ -19,6 +34,7 @@ export interface ExternalSaver {
 }
 
 export type SettingsSection =
+    | "updates"
     | "appearance"
     | "hardware"
     | "drive_motor"
@@ -32,9 +48,11 @@ export type SettingsSection =
     | "safety"
     | "obstacles"
     | "navigation"
-    | "rain"
+    | "weather"
     | "leds"
-    | "irrisense"
+    | "mqtt"
+    | "remote_access"
+    | "notifications"
     | "advanced";
 
 export type SectionMeta = {
@@ -46,6 +64,13 @@ export type SectionMeta = {
 };
 
 const SECTION_DEFINITIONS: SectionMeta[] = [
+    {
+        id: "updates",
+        label: "settingsSections.updates.label",
+        icon: "cloud-sync",
+        description: "settingsSections.updates.description",
+        keys: [],
+    },
     {
         id: "appearance",
         label: "settingsSections.appearance.label",
@@ -59,7 +84,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         icon: "tool",
         description: "settingsSections.hardware.description",
         keys: [
-            "mower_model", "wheel_radius", "wheel_track", "wheel_width",
+            "robot_name", "mower_model", "wheel_radius", "wheel_track", "wheel_width",
             "wheel_x_offset", "chassis_center_x", "chassis_length", "chassis_width",
             "chassis_height", "chassis_mass_kg", "caster_radius", "caster_track",
             "ticks_per_meter", "tool_width", "blade_radius",
@@ -73,6 +98,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         keys: [
             "wheel_pid_kp", "wheel_pid_ki", "wheel_pid_kd",
             "wheel_pid_integral_limit", "wheel_pid_pwm_per_mps",
+            ...groupKeys(YAW_LOOP_GROUP),
         ],
     },
     {
@@ -123,6 +149,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "use_lidar_map_anchor", "lidar_anchor_shadow_mode",
             "use_magnetometer",
             "enable_mag_cal", "declination_deg", "min_horizontal_uT", "mag_yaw_variance",
+            ...groupKeys(LOCALIZATION_GUARD_GROUP),
         ],
     },
     {
@@ -140,13 +167,15 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             // coverage_server, and the BT hardcodes mow_angle_deg=-1.0 "auto"),
             // so they were dead controls. swath_overlap (a real coverage_server
             // param) is surfaced here instead.
-            "mowing_enabled", "mowing_speed", "transit_speed",
+            "mowing_enabled", "blade_auto_reverse", "mowing_speed", "transit_speed",
             // Blade-load slowdown (FollowCoveragePath.blade_load_*, injected by
             // navigation.launch.py): slow the feed when the blade RPM sags.
             "blade_load_slowdown_enabled", "blade_load_rpm_full",
             "blade_load_rpm_min", "blade_load_min_speed_ratio",
             "headland_width", "num_headland_passes", "swath_overlap",
-            "chassis_safety_inset", "min_turning_radius", "mow_direction",
+            "chassis_safety_inset", "min_turning_radius", "mow_direction", "mow_cross_hatch",
+            "connector_max_headland_passes",
+            ...groupKeys(TURN_SPEED_GROUP),
         ],
     },
     {
@@ -159,6 +188,8 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "dock_max_retries", "dock_use_charger_detection",
             "dock_charging_threshold",
             "dock_approach_overshoot", "dock_pose_yaw_sigma_rad",
+            ...groupKeys(DOCK_DETECTION_GROUP),
+            ...groupKeys(DOCK_CALIBRATION_GROUP),
         ],
     },
     {
@@ -170,6 +201,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "battery_full_voltage", "battery_empty_voltage", "battery_critical_voltage",
             "battery_full_percent", "battery_low_percent", "battery_critical_percent",
             "battery_critical_recovery_percent", "battery_manual_resume_percent",
+            ...groupKeys(CHARGE_LIMITS_GROUP),
         ],
     },
     {
@@ -190,6 +222,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             // that mode is on. Listing them here is what keeps them out of
             // AdvancedSection's free-form editor, exactly as before.
             "lift_blade_resume_delay_sec", "lift_recovery_mode",
+            ...groupKeys(FIRMWARE_SAFETY_GROUP),
         ],
     },
     {
@@ -202,6 +235,8 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "obstacle_clearance_margin", "obstacle_detection_range_m",
             "obstacle_wait_timeout_s",
             "obstacle_margin", "obstacle_slowdown_ratio", "dig_obstacle_enabled",
+            "dig_sensitivity",
+            ...groupKeys(REVERSE_ESCAPE_GROUP),
         ],
     },
     {
@@ -213,13 +248,18 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "xy_goal_tolerance", "yaw_goal_tolerance", "coverage_xy_tolerance",
             "progress_timeout_sec",
             "boundary_inner_margin_m", "dock_inner_margin_exempt_radius_m",
+            ...groupKeys(AREA_RECORDING_GROUP),
+            ...groupKeys(BEHAVIOR_TREE_GROUP),
+            ...groupKeys(START_ESCAPE_GROUP),
         ],
     },
     {
-        id: "rain",
-        label: "settingsSections.rain.label",
+        // Rain sensor behaviour + the IrriSense soil-moisture skip: both
+        // decide whether the weather lets the robot mow.
+        id: "weather",
+        label: "settingsSections.weather.label",
         icon: "cloud",
-        description: "settingsSections.rain.description",
+        description: "settingsSections.weather.description",
         keys: ["rain_mode", "rain_delay_minutes", "rain_debounce_sec"],
     },
     {
@@ -235,16 +275,40 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "led_brightness", "led_idle_scale", "led_refresh_hz",
             "led_low_battery_percent", "led_charge_full_percent",
             "led_charge_complete_timeout_s", "led_charge_complete_dim_scale",
+            "led_charge_complete_indicator_count", "led_charge_complete_indicator_scale",
+            "led_charge_complete_indicator_ids",
             "led_status_timeout_s", "led_keepalive_s", "led_device_retry_s",
         ],
     },
     {
-        id: "irrisense",
-        label: "settingsSections.irrisense.label",
-        icon: "cloud-sync",
-        description: "settingsSections.irrisense.description",
-        // No yaml keys: the IrriSense settings (token included) live in the
-        // GUI's key-value DB and the section loads/saves them itself.
+        id: "mqtt",
+        label: "settingsSections.mqtt.label",
+        icon: "wifi",
+        description: "settingsSections.mqtt.description",
+        keys: [
+            // Every mqtt_* key is claimed here so none of them leaks into
+            // AdvancedSection's free-form editor — same rationale as "leds"
+            // above (a raw broker password with no context).
+            "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_username",
+            "mqtt_password", "mqtt_topic_prefix", "mqtt_use_ssl",
+            "mqtt_home_assistant_discovery_enabled",
+        ],
+    },
+    {
+        id: "remote_access",
+        label: "settingsSections.remote_access.label",
+        icon: "global",
+        description: "settingsSections.remote_access.description",
+        // No yaml keys: the remote-access settings (auth key included) live
+        // in the GUI's key-value DB and the section loads/saves them itself.
+        keys: [],
+    },
+    {
+        id: "notifications",
+        label: "settingsSections.notifications.label",
+        icon: "bell",
+        description: "settingsSections.notifications.description",
+        // Same as IrriSense: DB-backed, the section owns load/save.
         keys: [],
     },
     {
@@ -269,7 +333,18 @@ export const useSettingsManager = () => {
     const [defaults, setDefaults] = useState<Record<string, any>>({});
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
-    const [restartRequired, setRestartRequired] = useState(false);
+    const [restartRequired, setRestartRequired] = useState(() => {
+        try { return sessionStorage.getItem('mowgli.pendingRosRestart') === 'true'; }
+        catch { return false; }
+    });
+    useEffect(() => {
+        try { sessionStorage.setItem('mowgli.pendingRosRestart', String(restartRequired)); }
+        catch { /* Storage can be disabled in embedded browsers. */ }
+    }, [restartRequired]);
+    const acknowledgeRestart = useCallback(() => {
+        try { sessionStorage.removeItem('mowgli.pendingRosRestart'); } catch { /* optional storage */ }
+        setRestartRequired(false);
+    }, []);
     // GPS restart skips the rosbridge readiness probe (ROS2 is unaffected).
     const gpsRestart = useContainerRestart({
         pendingLabel: t("settingsManager.gpsRestartPending"),
@@ -442,6 +517,7 @@ export const useSettingsManager = () => {
             ];
             const liveHardwareKeys = ["ticks_per_meter", ...driveKeys];
             const liveHardwareDirty = liveHardwareKeys.some((k) => dirtyKeys.has(k));
+            const requiresRosRestart = [...dirtyKeys].some(key => !liveHardwareKeys.includes(key));
             const hasDirtyChanges = dirtyKeys.size > 0;
             const externalSavers = Object.values(externalSaversRef.current).filter((x) => x.dirtyCount > 0);
             if (!hasDirtyChanges && !shouldRestartGps && externalSavers.length === 0) {
@@ -475,12 +551,12 @@ export const useSettingsManager = () => {
                 }
                 setSavedValues(pruned);
                 setLocalValues(pruned);
-                setRestartRequired(true);
+                if (requiresRosRestart) setRestartRequired(true);
                 notification.success({
                     message: t("settingsSections.toasts.saved"),
                     description: shouldRestartGps
                         ? t("settingsSections.toasts.savedGpsRestartDescription")
-                        : t("settingsSections.toasts.savedDescription"),
+                        : t(requiresRosRestart ? "settingsSections.toasts.savedDescription" : "settingsSections.toasts.savedApplyingLive"),
                 });
             } else if (shouldRestartGps) {
                 notification.info({
@@ -554,6 +630,7 @@ export const useSettingsManager = () => {
                             body: { parameters },
                         });
                     } catch (e: any) {
+                        setRestartRequired(true);
                         notification.warning({
                             message: t("settingsSections.toasts.drivePidUpdateFailed"),
                             description: e?.message ??
@@ -695,13 +772,9 @@ export const useSettingsManager = () => {
     const matchesSearch = useCallback(
         (key: string, label?: string): boolean => {
             if (!searchQuery) return true;
-            const q = searchQuery.toLowerCase();
-            return (
-                key.toLowerCase().includes(q) ||
-                (label?.toLowerCase().includes(q) ?? false)
-            );
+            return matchesSettingSearch(searchQuery, key, label ?? '', ...settingSearchText(key, t));
         },
-        [searchQuery]
+        [searchQuery, t]
     );
 
     return {
@@ -718,6 +791,7 @@ export const useSettingsManager = () => {
         registerExternalSaver,
         unregisterExternalSaver,
         restartRequired,
+        acknowledgeRestart,
         searchQuery,
         advancedKeys,
         setSearchQuery,

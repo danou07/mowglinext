@@ -11,9 +11,9 @@
 #include <thread>
 
 #include <geometry_msgs/msg/quaternion.hpp>
-#include <tf2/LinearMath/Quaternion.h>
-#include <tf2/LinearMath/Transform.h>
-#include <tf2/exceptions.h>
+#include <tf2/LinearMath/Quaternion.hpp>
+#include <tf2/LinearMath/Transform.hpp>
+#include <tf2/exceptions.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include "fusion_graph/cog_flip_recovery.hpp"
@@ -395,6 +395,14 @@ void FusionGraphNode::OnHardwareStatus(mowgli_interfaces::msg::Status::ConstShar
   }
   last_is_charging_ = docked;
   last_is_charging_valid_ = true;
+}
+
+void FusionGraphNode::OnLocalizationMode(std_msgs::msg::Int32::ConstSharedPtr msg)
+{
+  // LocalizationMode::DEAD_RECKONING == 0
+  // (mowgli_localization/localization_monitor_policy.hpp).
+  last_position_dead_reckoning_ = (msg->data == 0);
+  last_position_dead_reckoning_valid_ = true;
 }
 
 }  // namespace fusion_graph

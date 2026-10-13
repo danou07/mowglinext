@@ -25,6 +25,7 @@
 #define MOWGLI_COVERAGE__COVERAGE_PLANNING_HPP_
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -73,6 +74,14 @@ struct BoustrophedonPlan
   std::vector<std::pair<std::pair<double, double>, std::pair<double, double>>> swaths;
   // Swath heading actually used (rad, map frame) — for logging.
   double swath_angle_rad = 0.0;
+  // Headland ring COUNT actually planned (the resolved n_rings — see
+  // planBoustrophedon's num_headland_passes_override three-way contract), not
+  // the raw config value: in AUTO (override == 0) this is the DERIVED count
+  // (ceil(headland_width / op_width), floored at 1), which
+  // connector_max_headland_passes still limits against even though the caller
+  // never configured a concrete pass count. 0 with the ring stage disabled
+  // (override < 0). Logging-only.
+  int n_headland_passes = 0;
   // Closed outer ring of the chassis-safety-inset field (the SAME inset the
   // rings/swaths are planned against, == generateHeadlands(field, inset)). The
   // continuous-path connectors and corner fillets MUST stay inside THIS ring,
@@ -82,36 +91,72 @@ struct BoustrophedonPlan
   // when no inset was applied (chassis_safety_inset <= 0) — the caller then
   // falls back to the raw boundary. (x, y) pairs, first == last.
   std::vector<std::pair<double, double>> safe_boundary;
-  // Closed outer ring the turn-around CONNECTORS/FILLETS must stay inside — the
-  // outermost headland RING's centerline (== safe_boundary eroded inward by
-  // op_width/2, == the recorded line eroded by chassis_safety_inset). This is
-  // TIGHTER than safe_boundary by op_width/2 and exists to close a spinning-blade
-  // safety gap: allInside() only tests the path CENTERLINE, so bounding it to
-  // safe_boundary let a turn-around arc's centerline reach op_width/2 FURTHER out
-  // than the outermost ring's, pushing the chassis (± robot_width/2) and blade
-  // that much past the operator boundary — and the excursion grew with the turn
-  // radius (buildConnector accepts the largest radius whose centerline still
-  // fits). Bounding connectors to the outermost-ring centerline instead makes a
-  // turn's footprint no worse than the perimeter ring the robot already drives.
-  // Deliberately op_width/2 (NOT robot_width/2): eroding by the chassis
-  // half-width would keep turns robot_width/2 − op_width/2 TIGHTER than the
-  // perimeter ring, forcing every edge turn-around below min_turning_radius →
-  // straight fallback → sub-path fragmentation. Empty when the erosion degenerates
-  // (tiny field) — the caller then falls back to safe_boundary. (x, y), first==last.
+  // Closed outer ring the turn-around CONNECTORS/FILLETS must stay inside —
+  // ALWAYS the outermost headland RING's centerline (== safe_boundary eroded
+  // inward by op_width/2, == the recorded line eroded by
+  // chassis_safety_inset), regardless of `connector_max_headland_passes`
+  // (issue #497 — see swath_turn_envelope below for the knob that actually
+  // limits turn-arounds). This is TIGHTER than safe_boundary by op_width/2
+  // and exists to close a spinning-blade safety gap: allInside() only tests
+  // the path CENTERLINE, so bounding it to safe_boundary let a turn-around
+  // arc's centerline reach op_width/2 FURTHER out than the outermost ring's,
+  // pushing the chassis (± robot_width/2) and blade that much past the
+  // operator boundary — and the excursion grew with the turn radius
+  // (buildConnector accepts the largest radius whose centerline still fits).
+  // Bounding connectors to the outermost-ring centerline instead makes a
+  // turn's footprint no worse than the perimeter ring the robot already
+  // drives. Deliberately op_width/2 (NOT robot_width/2): eroding by the
+  // chassis half-width would keep turns robot_width/2 − op_width/2 TIGHTER
+  // than the perimeter ring, forcing every edge turn-around below
+  // min_turning_radius → straight fallback → sub-path fragmentation. Empty
+  // when the erosion degenerates (tiny field) — the caller then falls back
+  // to safe_boundary. (x, y), first==last.
   //
-  // The invariant, uniform across both branches: a connector centerline may go
-  // NO FURTHER OUT than the outermost DRIVEN pass. WITH THE RING STAGE DISABLED
-  // (num_headland_passes < 0 → zero rings, issue #429) there is no ring 0 to
-  // erode to — the SWATH ENDS are then the outermost driven geometry and they
-  // lie exactly ON safe_boundary, so this ring is safe_boundary EXACTLY (no
-  // expansion, no erosion). Ends sitting on the ring are accepted by
-  // allInside()'s 1 mm on-edge tolerance, not by moving the polygon outward.
-  // Consequence to expect: with no mowed apron beyond the swath ends, a U-turn
-  // arc usually does NOT fit, so buildConnector falls back to a straight join —
-  // a pivot-through corner (which roundSharpCorners fillets where a
-  // min_turning_radius arc fits). That fallback still passes allInside, so
-  // conn_safe stays true and the sub-path does NOT fragment.
+  // Also the bound for buildContinuousSubPaths' out-of-bounds clamp (#388,
+  // clampInsideRing — applied to EVERY pose of EVERY sub-path, rings
+  // included), the server's post-plan verify, and every ring-to-ring /
+  // ring-to-swath connector — deliberately NEVER the tighter
+  // swath_turn_envelope: clamping or verifying a headland RING pose against a
+  // boundary narrower than ring 0 would silently project that ring's own
+  // poses onto a DIFFERENT ring's centerline (issue #497 review: with 3
+  // rings configured and turns limited to 2, ring 0 clamped against ring 1's
+  // envelope drove ring 1 twice and never drove ring 0 at all).
+  //
+  // WITH THE RING STAGE DISABLED (num_headland_passes < 0 → zero rings, issue
+  // #429) there is no ring to erode to — the SWATH ENDS are then the
+  // outermost driven geometry and they lie exactly ON safe_boundary, so this
+  // ring is safe_boundary EXACTLY (no expansion, no erosion). Ends sitting on
+  // the ring are accepted by allInside()'s 1 mm on-edge tolerance, not by
+  // moving the polygon outward. Consequence to expect: with no mowed apron
+  // beyond the swath ends, a U-turn arc usually does NOT fit, so
+  // buildConnector falls back to a straight join; since 40d0c30b a straight
+  // fallback is only kept blade-on when straightFallbackIsContinuous (its
+  // heading is within 15° of both segments) — a ~180° swath-to-swath reversal
+  // fails that test, so it becomes a PIVOT JOIN (explicit in-place pivot
+  // corners, see PivotJoinLimits) where the pivot sweep fits, and otherwise the
+  // sub-path SPLITS there (a blade-off Nav2 transit); it is never driven as a
+  // silent zero-radius corner. A tight
+  // `swath_turn_envelope` produces the exact same starved-apron split pattern
+  // one ring set further out — that is the intended trade-off of asking turns
+  // to stay off the outer band.
   std::vector<std::pair<double, double>> connector_clearance_boundary;
+  // A P-pass-deep turn envelope for MAINLAND SWATH-TO-SWATH connectors ONLY
+  // (`connector_max_headland_passes`, issue #497): with N total headland
+  // rings and a limit of P < N passes, this sits on ring (N − P)'s
+  // centerline instead of ring 0's — leaving the outermost (N − P) rings'
+  // band untouched by any row-end U-turn. Passed to buildContinuousSubPaths
+  // as its optional `swath_turn_boundary` argument, which uses it ONLY for
+  // buildConnector's allInside test on joins between two mainland swath
+  // segments. Every other use in that function — the ring-to-ring joins, the
+  // ring-to-first-swath transition, the #388 out-of-bounds clamp, and the
+  // whole-path corner fillet pass — stays bound to connector_clearance_boundary
+  // (ring 0) regardless of this field, so limiting how far a swath U-turn may
+  // swing can never relocate a headland ring pass onto a different ring's
+  // line. Empty when connector_max_headland_passes has no effect (<= 0,
+  // >= n_rings, or rings disabled) — the caller then uses
+  // connector_clearance_boundary for every join, identical to pre-#497
+  // behaviour. (x, y), first==last.
+  std::vector<std::pair<double, double>> swath_turn_envelope;
   // Inset ("grown") interior hole rings the continuous-path connectors and
   // corner fillets must stay OUT of, mirroring how safe_boundary is the ring
   // they must stay INSIDE. When the chassis-safety inset is applied these are
@@ -155,6 +200,28 @@ struct BoustrophedonPlan
 //                        Flips which side of the robot faces the boundary — set
 //                        it to keep a side-mounted blade on the cut side
 //                        (issue #335). Swaths/connectors follow the rings.
+//   connector_max_headland_passes (issue #497)
+//                        How many of the n_rings headland passes, counted from
+//                        the mainland edge OUTWARD, a MAINLAND SWATH-TO-SWATH
+//                        turn-around connector is permitted to cross. <= 0 or
+//                        >= n_rings: UNLIMITED — swath U-turns may use the
+//                        whole apron out to ring 0's centerline (the pre-#497
+//                        default, unchanged; plan.swath_turn_envelope stays
+//                        empty). In [1, n_rings): plan.swath_turn_envelope is
+//                        populated at ring (n_rings − value)'s centerline,
+//                        leaving the outermost (n_rings − value) rings' band a
+//                        no-turn zone for swath U-turns ONLY — e.g. 3 rings
+//                        configured with a limit of 2 keeps every mainland
+//                        U-turn off the outermost ring, trading a higher
+//                        straight-connector/split fallback rate (see
+//                        ConnectorStats) for staying further from the recorded
+//                        boundary during a turn. connector_clearance_boundary
+//                        itself is UNAFFECTED by this parameter — it always
+//                        stays ring 0's centerline, so ring-to-ring joins, the
+//                        #388 clamp and the server's verify never move. Has no
+//                        effect with rings disabled (n_rings == 0): there is
+//                        no ring to bound to, so swath_turn_envelope stays
+//                        empty.
 //
 // Geometry: safe = inset(field, chassis_safety_inset); rings are n_rings
 // concentric loops spaced op_width inside safe; mainland = inset(safe,
@@ -171,10 +238,16 @@ struct BoustrophedonPlan
 //
 // chassis_safety_inset is taken as-is here: the caller clamps it only at 0.0 (the
 // default rides the outermost ring ON the recorded line, chassis straddling by
-// design). The returned plan also carries connector_clearance_boundary (the
-// outermost-ring centerline) so the turn-around connectors can be bounded to the
-// perimeter ring rather than to safe_boundary — otherwise a turn arc's centerline
-// (and its swept footprint) rides op_width/2 past the rings toward the boundary.
+// design). The returned plan also carries connector_clearance_boundary (always
+// the outermost-ring centerline) so the turn-around connectors can be bounded
+// to a perimeter ring rather than to safe_boundary — otherwise a turn arc's
+// centerline (and its swept footprint) rides op_width/2 past the rings toward
+// the boundary — plus swath_turn_envelope, a tighter ring-bound
+// connector_max_headland_passes caps for mainland swath U-turns only (see the
+// BoustrophedonPlan field docs).
+// Deterministic Auto heading; degenerate clips never define an angle.
+std::optional<double> longestValidSwathAngle(const f2c::types::Swaths& swaths);
+
 BoustrophedonPlan planBoustrophedon(const f2c::types::Cell& field_cell,
                                     double op_width,
                                     double headland_width,
@@ -183,7 +256,9 @@ BoustrophedonPlan planBoustrophedon(const f2c::types::Cell& field_cell,
                                     double mow_angle_rad,
                                     double min_swath_length,
                                     int ring_direction = 0,
-                                    double min_turn_radius = 0.20);
+                                    double min_turn_radius = 0.20,
+                                    bool perpendicular = false,
+                                    int connector_max_headland_passes = 0);
 
 // Per-plan accounting of how every segment-to-segment join was resolved by
 // buildConnector's radius-shrink search. Pure visibility — populating it
@@ -220,7 +295,7 @@ BoustrophedonPlan planBoustrophedon(const f2c::types::Cell& field_cell,
 // provides a five-pass apron for 0.20 m arcs and splits any residual
 // discontinuous fallback. See the CoverageConnectorStats tests.
 //
-// The three outcomes are mutually exclusive and sum to `attempted`:
+// The four outcomes are mutually exclusive and sum to `attempted`:
 struct ConnectorStats
 {
   // Segment-to-segment joins where a connector was attempted (== segments - 1
@@ -232,13 +307,94 @@ struct ConnectorStats
   std::size_t arc = 0;
   // The shrink loop found no in-bounds arc, but its straight fallback stayed
   // inside the boundary, clear of holes, and aligned with both segment headings.
-  // Only this tangent-enough fallback is kept blade-on.
+  // Only this tangent-enough fallback is kept blade-on without a pivot.
   std::size_t straight_kept = 0;
+  // No arc fitted and the straight fallback is NOT aligned, but it is a short
+  // join between adjacent passes that passed every pivot-join check (see
+  // PivotJoinLimits): kept blade-on inside the sub-path, its corners encoded as
+  // explicit pivot corners FTC rotates in place at.
+  std::size_t pivot = 0;
   // No continuous blade-on connector: empty, outside the boundary, through a
-  // hole, or a straight fallback whose heading is discontinuous. The sub-path
-  // is broken here and FollowStrip repositions and reorients blade-off.
+  // hole, or a discontinuous straight fallback that is not an acceptable pivot
+  // join. The sub-path is broken here and FollowStrip repositions and reorients
+  // blade-off.
   std::size_t split = 0;
 };
+
+// The server reports connector outcomes at WARN when at least this share of
+// attempted joins split into blade-off transits. This is a visibility threshold,
+// not a planner rejection rule: a small number of splits is normal on concave
+// geometry, while a high share makes the resulting transits easy to miss.
+constexpr double kConnectorSplitWarnPct = 25.0;
+
+// True when ConnectorStats should be reported at WARN. The zero-attempt case is
+// intentionally not a warning: no connector was attempted, so there is no
+// split rate to report.
+inline bool connectorSplitRateWarns(const ConnectorStats& stats)
+{
+  return stats.attempted > 0 &&
+         100.0 * static_cast<double>(stats.split) / static_cast<double>(stats.attempted) >=
+             kConnectorSplitWarnPct;
+}
+
+// When (and where) a join that fits no forward arc may still stay inside the
+// sub-path as a PIVOT JOIN — a straight connector whose zero-radius corners FTC
+// drives as in-place pivots (corner encoding: mowgli_interfaces/
+// coverage_geometry.hpp, "PIVOT CORNER CONTRACT").
+//
+// Why it exists: with a thin headland apron (num_headland_passes auto on a
+// narrow tool, or none) no arc of radius >= min_turning_radius fits between the
+// swath ends and the clearance ring, so every row end split into a blade-off
+// Nav2 transit + a PRE_ROTATE — 128 sub-paths / 127 transits on a 152 m² lawn
+// (field 2026-09-21, 6.7 % mowed in 6 minutes).
+//
+// A join becomes a pivot join only when ALL of the following hold, otherwise it
+// splits exactly as before:
+//   * pivot joins are enabled (sweep_radius > 0);
+//   * the straight connector is at most kSegmentTransitGapM long — a turn-around
+//     between ADJACENT passes, never a relocation;
+//   * the connector centreline stays inside the connector boundary and clear of
+//     the (margin-grown) holes — the same allInside / clearOfHoles tests every
+//     other blade-on join passes;
+//   * at every corner the robot pivots at, the disc the chassis sweeps rotating
+//     in place about base_link (rear wheel axis, radius sweep_radius) stays
+//     inside the RECORDED boundary grown by boundary_margin (map_server's
+//     non-lethal soft band) and clear of every DRAWN obstacle.
+// The blade stays ON through a pivot join: it lies inside the mowing area
+// between two adjacent passes, exactly like the blade-on arcs it replaces.
+struct PivotJoinLimits
+{
+  // Radius (m) of the disc the chassis sweeps pivoting in place about
+  // base_link: robot_config_util.chassis_circumscribed_radius (0.597 m shipped).
+  // <= 0 disables pivot joins — the pre-pivot behaviour (and the default, so an
+  // uninjected server never pivots).
+  double sweep_radius = 0.0;
+  // How far past the recorded boundary the body may reach (m): map_server's
+  // non-lethal soft band, enforce_boundary_margin_m floored at the chassis
+  // circumscribed radius (robot_config_util.boundary_soft_margin).
+  double boundary_margin = 0.0;
+  // The RECORDED outer boundary — the operator polygon before any inset or
+  // outward expansion (open or closed ring).
+  std::vector<std::pair<double, double>> recorded_boundary;
+  // The DRAWN obstacles — operator polygons before obstacle_margin. The sweep
+  // must clear these by sweep_radius; the margin-grown safe_holes only bound
+  // the connector centreline.
+  std::vector<std::vector<std::pair<double, double>>> recorded_obstacles;
+};
+
+// True iff a robot pivoting in place with base_link at (x, y) sweeps only
+// ground inside `limits.recorded_boundary` grown by `limits.boundary_margin`
+// and clear of every `limits.recorded_obstacles` polygon. Conservative: the
+// whole disc of radius sweep_radius is tested, whatever the rotation. False
+// when pivot joins are disabled or the recorded boundary is missing.
+bool pivotSweepFits(double x, double y, const PivotJoinLimits& limits);
+
+// Yaw of every pose of a drivable sub-path, honouring the pivot corner
+// contract: a pose followed by a pose at the SAME position (a pivot corner)
+// takes the INCOMING heading, its twin the outgoing one; every other pose takes
+// the heading of the step to its successor, the last pose that of the step
+// into it. coverage_server stamps these into the result poses.
+std::vector<double> pathHeadings(const std::vector<std::pair<double, double>>& pts);
 
 // Flatten a BoustrophedonPlan into continuous, in-bounds polylines that FTC can
 // track without crossing a zero-radius segment join.
@@ -293,19 +449,66 @@ std::vector<std::pair<double, double>> buildContinuousPath(
 // connector exists. This includes straight fallbacks between antiparallel
 // swaths: keeping them would hand FTC a zero-radius corner and cause alternating
 // saturated steering commands.
-// Swath pieces are nearest-endpoint chained before joining (identical to the
-// plain serpentine on a convex field; mows each lobe of a concave/hole-split
-// field contiguously so a lobe change costs ONE split, not one per column).
+// Swath pieces are chained by feasible connector length plus a stop/turn
+// penalty for pivot or transit joins. The original first swath remains the seed;
+// all swaths are visited once. This can skip a row for a shorter, wider turn and
+// return for the skipped row later; it never changes the cut geometry.
 // The caller (FollowStrip) drives them in order, bridging every sub-path boundary
 // with a blade-off, costmap-aware Nav2 reposition/reorientation. Sub-paths with
 // fewer than two points are dropped.
+//
+//   swath_turn_boundary (issue #497) — optional, defaults to empty (meaning
+//                        "no override, use `boundary` for every join": every
+//                        existing call site is unaffected). When populated
+//                        (size >= 3, normally plan.swath_turn_envelope), it
+//                        REPLACES `boundary` inside buildConnector's
+//                        allInside/clearOfHoles test, but ONLY for joins
+//                        where both the previous and the current segment are
+//                        mainland swaths (a row-end U-turn) — ring-to-ring
+//                        joins, the ring-to-first-swath transition, the #388
+//                        out-of-bounds clamp, and the whole-path corner
+//                        fillet pass all stay bound to `boundary` regardless.
+//                        This is what lets connector_max_headland_passes
+//                        keep swath U-turns off the outer rings WITHOUT ever
+//                        clamping a ring's own poses onto a different ring's
+//                        centerline (see BoustrophedonPlan::swath_turn_envelope).
+//   pivot_limits       — optional, defaults to disabled (every existing call
+//                        site is unaffected). When enabled, a join that fits
+//                        no arc and is not an aligned straight connector is
+//                        kept as a PIVOT JOIN instead of splitting, where the
+//                        PivotJoinLimits checks allow it. Its corners are
+//                        emitted per the pivot corner contract
+//                        (mowgli_interfaces/coverage_geometry.hpp): the corner
+//                        position twice in a row. Every OTHER near-coincident
+//                        pose pair is collapsed, enabled or not, so a
+//                        zero-length step in a sub-path always means a pivot.
 std::vector<std::vector<std::pair<double, double>>> buildContinuousSubPaths(
     const BoustrophedonPlan& plan,
     const std::vector<std::pair<double, double>>& boundary,
     double turn_radius,
     double min_turn_radius,
     double step,
-    ConnectorStats* stats = nullptr);
+    ConnectorStats* stats = nullptr,
+    const std::vector<std::pair<double, double>>& swath_turn_boundary = {},
+    const PivotJoinLimits& pivot_limits = {});
+
+// Reorders a set of FINISHED, hole-free sub-path polylines (as produced by
+// buildContinuousSubPaths above, which calls this internally) to minimize the
+// total blade-off Nav2 transit between them — trying every sub-path as the
+// starting point, not just the first, and entering every other sub-path from
+// whichever end is nearer. Pure function of the sub-path geometries alone (no
+// robot position), so it stays deterministic: a fixed input always returns
+// the same output, which is what lets the BT resume coverage by sub-path
+// index across re-plans of the same field. See its own doc comment
+// (coverage_planning.cpp) for the full rationale and the O(n^3)
+// kMaxSeedSearchSize bound. Returns the input unchanged (same order and
+// direction) when no reordering would shorten the total transit.
+// The first preserve_direction_count input paths may move in the sequence but
+// may not reverse. The builder protects ALL paths containing headland rings,
+// including obstacle loops; sub-path 0 always retains its historical protection.
+std::vector<std::vector<std::pair<double, double>>> orderSubPathsForMinimalTransit(
+    std::vector<std::vector<std::pair<double, double>>> sub_paths,
+    std::size_t preserve_direction_count = 1);
 
 // 2-D point-in-polygon (ray casting) against `ring`, a list of (x, y)
 // vertices. Open or closed ring; winding-independent. Used by the server to
@@ -335,6 +538,14 @@ f2c::types::LinearRing dedupClosedRing(const f2c::types::LinearRing& in);
 // margin < 1e-3 or a degenerate ring falls back to dedupClosedRing(in): the
 // obstacle is never dropped, only the extra margin. Pure function — testable.
 f2c::types::LinearRing bufferRingOutward(const f2c::types::LinearRing& in, double margin);
+
+// Shrink a ring inward by `distance` metres (GDAL Buffer with a negated
+// distance, rounded joins) and return it dedup-closed. Unlike
+// bufferRingOutward, erosion can legitimately collapse a small or thin
+// polygon to nothing — that is reported by returning an EMPTY ring (size 0),
+// which the caller MUST treat as failure, never as "no correction needed".
+// distance <= 0 returns dedupClosedRing(in) unchanged. Pure function.
+f2c::types::LinearRing erodeRingInward(const f2c::types::LinearRing& in, double distance);
 
 }  // namespace mowgli_coverage
 

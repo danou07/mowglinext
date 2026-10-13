@@ -2,7 +2,7 @@
 
 Comprehensive technical documentation of the Mowgli ROS2 system design, including package organization, data flow, communication protocols, and integration points.
 
-Built on **ROS2 Kilted** with **Webots** simulation, this architecture spans 12 focused packages providing complete autonomous lawn mower functionality. [CLAUDE.md](https://github.com/mowglinext/mowglinext/blob/main/CLAUDE.md) is the authoritative short-form reference and the place to check first if any page on the wiki looks out of date.
+Built on **ROS2 Lyrical** with **Webots** simulation, this architecture spans 12 focused packages providing complete autonomous lawn mower functionality. [CLAUDE.md](https://github.com/mowglinext/mowglinext/blob/main/CLAUDE.md) is the authoritative short-form reference and the place to check first if any page on the wiki looks out of date.
 
 Machine-generated indexes of the same code live in the repo and are refreshed with it — useful when you need file/line precision rather than prose: [`docs/claude/codemaps/`](https://github.com/mowglinext/mowglinext/tree/main/docs/claude/codemaps) (one per package), [`docs/claude/ros-interfaces.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/ros-interfaces.md) (every topic/service/action/TF and who publishes it), [`docs/claude/parameters.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/parameters.md), [`docs/claude/testing-ci.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/testing-ci.md), and [`docs/claude/doc-index.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/doc-index.md) (which document is authoritative vs historical). Each top-level directory also carries a short `CLAUDE.md` pointer file.
 
@@ -231,7 +231,7 @@ Application layer
 - **ObstacleArray.msg** – Collection of tracked obstacles from obstacle_tracker_node
 - **TrackedObstacle.msg** – Individual persistent obstacle with position, age, and observation count
 - **MapObstacleInfo.msg** – Per-area obstacle identity/state returned by `~/get_mowing_area`
-- **DigEvent.msg** – Wheel-slip dig report from `hardware_bridge_node`'s dig detector (`~/dig_event`), promoted to a keepout by `map_server_node`
+- **DigEvent.msg** – Wheel-slip dig report from `hardware_bridge_node`'s dig detector (`~/dig_event`); `map_server_node` records it as an operator-reviewable proposal (never an automatic keepout) and `behavior_tree_node` turns it into a session dig skip zone for `FollowStrip`
 - **GnssStatus.msg** – Authoritative receiver status from the GNSS sidecar (`/gps/status`)
 - **DockCalibrationStatus.msg** – Progress/result feed for the one-click dock calibration
 
@@ -416,10 +416,11 @@ struct LlCmdVel {
 | 0x50 | LL_CMD_VEL | Pi → STM32 | Motor velocity commands |
 | 0x51 | LL_CMD_BLADE | Pi → STM32 | Blade motor control |
 | 0x52 | LL_REBOOT | Pi → STM32 | Reboot the board (guarded by a magic byte) |
-| 0x54 / 0x55 | LL_SET_DRIVE_PID / LL_SET_YAW_PID | Pi → STM32 | Runtime tuning of the firmware wheel-velocity and yaw-rate loops |
-| 0x56 / 0x57 | LL_SET_KINEMATICS / LL_SET_SAFETY_LIMITS | Pi → STM32 | Runtime max-speed + wheel base; charge ceiling + e-stop timeouts |
+| 0x58 | LL_SET_PARAM | Pi → STM32 | Set one runtime firmware parameter (wheel/yaw loops, speed cap, wheel base, charge ceiling, e-stop timings, tilt threshold) |
+| 0x59 / 0x5A | LL_GET_PARAM / LL_PARAM_COMMIT | Pi → STM32 | Ask for the applied values; persist the set in the board's flash |
+| 0x13 / 0x14 | LL_PARAM_VALUE / LL_PARAM_STORE_STATUS | STM32 → Pi | Applied value + envelope per parameter; flash persistence state (→ `/hardware_bridge/firmware_params`) |
 
-The wire protocol is versioned: `kMowgliProtocolVersion` in `ll_datatypes.hpp` must match what the firmware reports through the config handshake, or `PreFlightCheck` blocks mowing.
+Runtime parameters (protocol v7) are coerced by the firmware into an absolute envelope and stored in its flash, so the board runs them from power-on, before ROS2 connects. The wire protocol is versioned: `kMowgliProtocolVersion` in `ll_datatypes.hpp` must match what the firmware reports through the config handshake, or `PreFlightCheck` blocks mowing.
 
 #### Data Flow Diagrams
 
@@ -634,7 +635,7 @@ wheel_odometry:
     publish_tf: false         # fusion_graph_node owns odom → base_footprint
 ```
 On the live robot the equivalent values reach `hardware_bridge_node` (and the
-STM32, via `LL_SET_KINEMATICS`) from `mowgli_robot.yaml` — `ticks_per_meter` and
+STM32, via `LL_SET_PARAM`) from `mowgli_robot.yaml` — `ticks_per_meter` and
 `wheel_track` — which is the file calibration writes back to.
 
 #### 3b. navsat_to_absolute_pose_node
@@ -809,7 +810,7 @@ installed file) and passes it on the `xacro` command line, so the yaml — not t
 (measured on a YardForce 500):
 
 - **Chassis:** 0.60 m long × 0.40 m wide × 0.19 m tall, geometric centre 0.18 m ahead of `base_link` (rear bumper −0.12 m, front bumper +0.48 m). Nav2's footprint is derived from these.
-- **Drive wheels (rear):** 0.04475 m radius, 0.04 m width, 0.325 m track (centre-to-centre). `wheel_track` is also pushed to the STM32 via `LL_SET_KINEMATICS` and must match the firmware's assumption.
+- **Drive wheels (rear):** 0.04475 m radius, 0.04 m width, 0.325 m track (centre-to-centre). `wheel_track` is also pushed to the STM32 via `LL_SET_PARAM` and must match the firmware's assumption.
 - **Casters:** front pair, 0.03 m radius, 0.36 m track
 - **Ground clearance:** `base_link` sits exactly one wheel radius above ground
 - **Blade:** 0.09 m radius disc, 0.01 m height (under base_link); `tool_width` = 2 × `blade_radius` = 0.18 m
@@ -1099,7 +1100,6 @@ FollowCoveragePath:                         # coverage
   obstacle_footprint: true
   use_footprint_clearance: false            # field: full-footprint sweep too conservative
   require_clear_exit: true                  # cul-de-sac guard — do not skirt a wall
-  ignore_obstacles_outside_zone: true
   enable_obstacle_deviation: true
   max_lateral_deviation: 1.5                # overridden from max_obstacle_avoidance_distance
   obstacle_wait_timeout_s: 2.5
@@ -1750,7 +1750,7 @@ Simulation Stack (webots_ros2_driver + ros2_control)
 | `ros2 launch mowgli_simulation webots_minimal.launch.py` | Webots + the world + ros2_control only, no Nav2 stack. `world:=` selects a file inside `worlds_webots/` |
 | `cd ros2 && make e2e-test` | Self-contained: `sim-stop`, build, launch the sim, wait, run `src/e2e_test.py`, stop the sim |
 
-**Container:** the `simulation` Docker stage (`ros2/Dockerfile`) extends `runtime` with Xvfb, TigerVNC + noVNC for GUI access, `ros-kilted-webots-ros2`, and the Webots release `.deb`. Cyberbotics publishes that `.deb` for **linux/amd64 only**, and the stage asserts `TARGETARCH = amd64`, so the simulation image cannot be built on ARM (Apple Silicon or a Raspberry Pi needs emulation or an x86 host). The `runtime` image stays architecture-neutral.
+**Container:** the `simulation` Docker stage (`ros2/Dockerfile`) extends `runtime` with Xvfb, TigerVNC + noVNC for GUI access, `webots_ros2` built from a pinned source revision, and the Webots release `.deb`. Cyberbotics publishes that `.deb` for **linux/amd64 only**, and the stage asserts `TARGETARCH = amd64`, so the simulation image cannot be built on ARM (Apple Silicon or a Raspberry Pi needs emulation or an x86 host). The `runtime` image stays architecture-neutral.
 
 **After any crash, run `make sim-stop` before relaunching** — a stale Webots IPC socket or leftover Cyclone DDS shared memory hangs the next launch in a retry loop.
 
@@ -2088,7 +2088,7 @@ The one sim-only addition is `/sim/ground_truth_pose`, published by the `kinemat
    - **Infrastructure:** mowgli_bringup (launch files, the config template, Nav2 params, and the URDF/xacro — there is no separate `mowgli_description` package)
    - **Third-party:** `opennav_coverage` git submodule for the `_msgs` action definitions only — that is the sole subpackage `ros2/scripts/sync_workspace_packages.sh` symlinks into the workspace, so colcon never sees the upstream servers (there are no `COLCON_IGNORE` files).
 
-2. **ROS2 Kilted + Webots R2025a:** Modern robotics stack with lifecycle management, and a simulator that runs the identical ROS2 stack (see [§9](#9-mowgli_simulation)).
+2. **ROS2 Lyrical + Webots R2025a:** Modern robotics stack with lifecycle management, and a simulator that runs the identical ROS2 stack (see [§9](#9-mowgli_simulation)).
 
 3. **Decoupled Communication:** ROS2 pub/sub (topics), services, and actions isolate packages. Easy to substitute, test, or extend components independently.
 

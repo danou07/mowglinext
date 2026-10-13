@@ -1,0 +1,768 @@
+# Software updates and recovery
+
+Settings → Updates reports installed software, mainboard firmware and web build
+identities. On a managed installation it also checks for complete deployments and
+installs a reviewed selection. Updates are never installed automatically.
+
+The desktop rail footer shows the verified running version and track; mobile
+shows the same summary in More. Clicking it opens Updates. Custom combinations
+and unverified installations are labelled explicitly instead of claiming the
+base release or available update is running. This reads local cached status only.
+
+## Simple and Advanced views
+
+The screen opens in **Simple**. It shows the installed version and pin, the source
+being checked and the available release once. **Check for updates** and
+**Review update** sit directly below, before the list of running components.
+Simple rows do not repeat a target release number beside each container. Firmware health, errors, active update/recovery
+status and recovery actions remain visible. The updater service offers its own
+update action only when a different published binary is available.
+
+**Advanced** adds source, repository, branch, check frequency, retained-version
+selection, compatible per-service overrides and pin controls. Advanced separates **Published releases** from **Custom images**. Installed container identities, web build details,
+manual per-image comparisons and deployment history also live here. The view
+switch changes presentation only: it does not check remotely, install anything
+or change policy. Unsaved source edits must be saved or reset before review.
+Simple lets the operator choose Production, Development or a named custom branch,
+then reviews the latest published deployment from that source and preserves an
+existing pin; switching back from Advanced cannot install a hidden older selection.
+Production selects the highest `vMAJOR.MINOR.PATCH`, so a later-published backport
+does not replace a newer version. Development and custom snapshots use publication
+time. Older compatible versions remain selectable explicitly in Advanced.
+
+The confirmation names the version, repository/branch and affected components.
+It explains downtime, backups and firmware scope. Exact before/after image
+identities are under **Container image details**. This keeps the ordinary path
+short while preserving the information needed to assess custom builds or
+troubleshoot recovery. The same control and order are used on desktop and mobile;
+Advanced fields stack into one column on narrow screens.
+
+### Selecting another branch or fork
+
+1. In **Simple**, choose **Production**, **Development** or **Custom branch**.
+   The same controls also remain under **Advanced → Update settings**.
+2. Choose an enabled repository when more than one is configured. For Custom
+   branch, type the full name, for example `feat/settings-updates`; slashes are
+   preserved. This is a branch-name field, not a list of every GitHub branch.
+3. Click **Check for updates** in Simple, or **Save settings** in Advanced. Choose
+   Latest or a retained deployment, then Review installation. Selecting a source
+   alone never replaces containers.
+
+An administrator enables a fork by adding it to the existing host config's list
+(preserve the other settings), for example:
+
+```json
+"trusted_repositories": [
+  "mowglinext/mowglinext",
+  "wjcloudy/mowglinext"
+]
+```
+
+The file is `/etc/mowgli-updater.json`. Restart `mowgli-updater.service` while no
+update/recovery is in progress to load the new list. The repository picker is
+populated from that list; the browser cannot add arbitrary repositories.
+
+Each selected source must publish the same complete deployment format with
+readable release assets and GHCR images for the host architecture. A forked branch
+with code but no complete published deployment shows **No installable build**.
+Production/dev tracks can also be selected within a trusted fork. The upstream
+source remains available for switching back. The current PR branch has not yet
+completed an end-to-end deployment publication/field trial; ordinary branch image
+builds by themselves do not make it installable through this screen.
+
+## Supported installations
+
+The host updater is a static Go executable for **Linux ARM64 or AMD64**, supervised
+by systemd. It uses the installed Docker Engine and Compose v2 CLI, together with
+standard host `tar`, `du` and `mv` tools. No Go toolchain, Watchtower, database
+service or container orchestrator is needed on the mower.
+
+Raspberry Pi OS 64-bit, Ubuntu and Debian retain their existing architecture
+support. Automatic installation requires the standard installer Compose layout,
+host networking and the Mowgli mainboard readiness interface. ARM32, Windows,
+macOS, rootless Docker, Podman and non-systemd installations are not supported by
+this updater. Version reporting and manual image comparison remain available
+when the host service is absent. MAVROS/other hardware backends without Mowgli
+firmware readiness cannot pass the automatic installation gate.
+
+## First installation or adoption
+
+Run the normal installer from the selected checkout. It downloads the matching
+`updater-<full-commit>` release binary and verifies its SHA-256 checksum, installs
+`/usr/local/bin/mowgli-updater`, `/etc/mowgli-updater.json` and the systemd unit,
+then adds the socket and maintenance mounts to the generated Compose stack.
+An unpublished checkout keeps manual operation and prints a warning. Developers
+can supply a locally built, trusted binary with `MOWGLI_UPDATER_BINARY`.
+
+The updater only replaces containers after **both installed GUI and ROS2 images
+support maintenance API 1**. Older installations need the normal installer image
+upgrade first. The initial custom/LFP installation is not silently adopted as an
+upstream deployment. Existing image IDs are retained for recovery when the first
+reviewed update runs.
+
+The installer stops and removes only the named Watchtower container belonging to
+this Compose project. Managed GUI images opt out of Watchtower. The updater
+conservatively refuses installation while any Watchtower container is running;
+an administrator must stop it before proceeding. Existing trusted repositories
+and updater state survive an installer rerun. A different checkout/project/path
+requires an explicit configuration migration.
+
+## Tracks, versions and notifications
+
+- **Production** lists stable releases carrying a complete deployment descriptor.
+- **Development** lists complete snapshots published from `dev`.
+- **Custom branch** uses the full branch name in a trusted repository. Forks must
+  first be added by an administrator to `trusted_repositories` in the host config.
+
+Save settings changes the notification source, not the running deployment.
+Choose the latest published snapshot or a specific retained version, optionally
+pin it, then review and install. The installed source and pin change only after
+successful activation. A pin does not suppress notifications or explicit changes.
+Production/dev/custom switching uses the same reviewed installation path.
+
+Checks run every 24 hours by default, with up to 15 minutes of persisted jitter.
+Hourly, four-hourly and manual-only checks are also available. Existing saved
+intervals are preserved on upgrade. A failed check retains the
+previous successful results and retries after 15 minutes plus jitter. UI status
+polls read local state; opening a page does not start a remote check. Notification
+read/dismiss state survives GUI and host restarts. Different source histories are
+shown for review; a date alone never proves that source code is newer.
+
+## What an installation does
+
+Verification reports the failing component or check, such as an unhealthy GPS
+container, missing LiDAR scans, an unexpected image, or incompatible firmware.
+When only an optional component is already unhealthy, review shows its exact
+service/check identity and offers an explicit forced installation. The updater
+samples those checks again immediately before maintenance and accepts after the
+update only the same failures which still existed at that point. A recovered
+check loses its exception; a new failure on another component, or a different
+failure on the same component, still triggers rollback. Core GUI/ROS runtime,
+image identity, mower readiness, maintenance and firmware checks are never
+forceable through this path.
+If activation fails, that reason remains in the job/history after rollback.
+Rollback still verifies the restored Compose definition, images, containers,
+application data, firmware compatibility, and core mower safety before releasing
+maintenance. Runtime and application-level checks for optional modules remain strict
+acceptance checks for new images, but cannot strand a successfully restored previous
+deployment in maintenance. Any such failures are retained as visible component warnings
+after rollback. New standard sidecars inherit this behavior without being named in the
+recovery flow. A missing service definition, wrong restored image, core GUI/robot failure,
+firmware mismatch, unsafe mower state, or data-restore failure remains blocking. The
+updater records that recovery reason separately instead of replacing the original
+activation failure, keeps the mower inhibited, and offers recovery again.
+
+GNSS verification does not require RTK or an outdoor position fix. It accepts
+fresh position messages, or a healthy receiver transport/parser with advancing
+runtime observations from the same receiver identity and process incarnation.
+The fallback uses Universal GNSS's live `get_snapshot` service through the GUI's
+existing ROS bridge. A responsive process, frozen counters, cached status,
+correction traffic alone, and missing/disconnected receivers do not satisfy it.
+Older GUIs/receivers without this snapshot contract still need fresh position
+messages. Configured LiDAR still requires fresh scans. These checks affect
+update acceptance only; they do not change mowing or firmware safety gates.
+Upgrade the host updater before installing the new GUI to use no-fix acceptance;
+an older updater ignores the additional receiver-progress fields.
+
+The GNSS container health probe loads the image's ROS environment and checks
+typed service results for the receiver and, when configured, NTRIP. Process
+responsiveness and actual receiver data progress are deliberately separate checks.
+The GNSS sidecar adds no persistent storage: its launch logs and exports live
+in the bounded `/run/universal_gnss` tmpfs (PR #687), so a release bundle can
+introduce it on an existing robot without a storage migration. A release that
+ADDS a writable mount is refused at review time.
+
+1. Resolve a complete compatible deployment to immutable platform image digests.
+   The review expires after 15 minutes and includes current and target images.
+2. Take the deployment lock, verify the installation has not changed, and pull
+   all required images before stopping anything. At least 2 GiB must be free in
+   the updater state filesystem; Docker can require additional image storage.
+3. Require fresh live firmware/status/odometry, idle behavior, stationary wheels
+   and a stopped blade. Write the persistent maintenance marker. ROS2 rejects
+   starts and inhibits outgoing wheel/blade commands while it exists, including
+   after reboot. This does not replace firmware safety or emergency stop.
+4. Retain old image IDs, stop all managed writers and archive the GUI database,
+   configuration and maps, syncing and checksumming each archive. Require space for backups and failed-deployment data.
+5. Activate the reviewed Compose definition, retire owned services without deleting
+   volumes, and replace managed containers in their declared dependency order (sensors before
+   ROS2, then GUI by default). Verify actual
+   image IDs, container state, fresh application readiness, firmware protocol
+   and installed sensor publishers before committing. Charging current and RTK
+   fix quality are not readiness requirements.
+6. On failure, restore previous configuration/data and images. Retain failed data
+   for diagnosis. Release maintenance only after verified success or recovery.
+
+ROS2, GUI, GPS and the installed supported LiDAR variant participate by default.
+Additional installed first-party services opt in through Compose labels (below).
+Unmanaged services, including MQTT by default and the optional remote-access sidecar `mowgli-remote` (GUI-owned, see `docs/REMOTE_ACCESS.md`), remain outside this transaction. Firmware, host OS and Docker
+upgrades are excluded; custom/LFP firmware is not flashed. Targets requiring a
+different updater API, layout or data schema are rejected. A target built for a
+**different mainboard firmware protocol** is rejected by default, because the
+containers cannot flash the STM32 and the bridge refuses a board speaking
+another protocol — but that refusal would otherwise strand every robot on the
+old protocol, since the matching firmware ships INSIDE the new GUI image (the
+one it refuses to install). The operator can therefore force it (below).
+Older releases without a deployment descriptor are comparison-only.
+
+### Forcing a firmware protocol change
+
+`POST /v1/plan` plans a target whose `firmware_protocol` differs from the
+protocol the board reported in its handshake (`/api/system/update-readiness`
+→ `firmware_protocol`; a board with no handshake, protocol 0, is never forced
+past) unless `allow_firmware_protocol_change: false` is sent. The plan records
+the pair as `firmware_protocol_change: {from, to}`, and `POST /v1/apply`
+installs it unless `firmware_protocol_acknowledged: false` is sent. **Both
+flags are tri-state and an ABSENT flag means allowed**: the GUI that predates
+them is precisely the one that can only obtain the matching firmware from the
+image it is installing, so it must not be locked out — after its update the
+new GUI shows the flash alert. A GUI that knows the flags always sends an
+explicit value and does its own gating: a warning with an "install anyway"
+checkbox at review, and a second acknowledgement in the review dialog (the
+consequence is read there, so it is repeated at install like the custom-image
+one). Capability `firmware-protocol-change` advertises the flags; an older
+agent rejects them as unknown fields, so the GUI never sends them to it and
+tells the operator to update the agent first.
+
+This is the **update-first** counterpart of the protocol-first transition
+described under *Recovery and updater self-updates*: same readiness contract,
+opposite order. The recorded pair travels with the job and is the ONE unready
+state the maintenance gate and verification accept: the readiness endpoint
+reporting `maintenance_ready` (fresh firmware, blade and wheel telemetry, idle,
+stationary, blade off — everything except the bridge's compatibility bit)
+**while the board still reports `from` or `to`**. Any other unready reason, a
+missing handshake (protocol 0), a third protocol, or a GUI predating the
+`maintenance_ready` contract still fails verification and rolls back. This is
+the only exception to "maintenance-only readiness cannot release the mower",
+and it exists because the operator acknowledged it twice; the bridge blocks
+mowing regardless until the firmware matches. The same tolerance covers a
+rollback started before the board was flashed, in which the previous images
+meet the same refusal from the other side. After a successful forced install
+the GUI shows a persistent "flash the mainboard firmware now" alert (Firmware
+section, ST-Link) until the board reports the new protocol.
+
+## Installed stack, health and component versions
+
+The updater samples **local Docker state every 15 seconds**, independently of
+remote update checks. Page loads read that cache. Samples older than one minute,
+failed inspections and active transactions report unknown status. Container
+health means running and, when Docker defines a healthcheck, healthy; it does
+not claim field readiness, positioning accuracy or that the mower is idle.
+The stricter application/sensor readiness gates still control installation.
+
+A successful transaction records every managed container's actual image ID.
+The current label is a matched release only while those IDs and service membership
+still match. A deliberately selected component override shows **Custom combination**;
+manually changed images or managed membership show **Installation changed**.
+The last recorded base and component versions remain visible as reference. Older
+journals lacking recorded IDs show unverified until a coordinated installation.
+A custom installation is never inferred to be an upstream release from tags alone.
+
+Simple shows one installed stack and one Check for updates / Review update flow.
+Advanced adds a **Release version** selector, pin, and a version selector beside
+**every managed service**: ROS2, GUI, GPS, the selected LiDAR driver and future
+first-party helpers. Each follows the selected release by default. **Reset all to
+release versions** clears the draft exceptions. Settings for source, repository,
+branch and frequency are collapsed under **Update settings**; history and diagnostics
+are separate. Mobile stacks each service's controls beneath its running version.
+Advanced shows **Built** from the installed container image metadata and
+**Published** from the deployment descriptor, including date, time and timezone.
+Release, component and updater choices include publication dates; the full selected
+date remains visible below component selectors on mobile. Missing or invalid image
+build timestamps show Unknown, never the release publication date as a substitute.
+Unmanaged MQTT has a local badge, and the host updater has a separate reviewed action.
+
+The installed base remains selectable when it has aged out of the release list and
+belongs to the selected source. Individual choices come from complete published
+releases in that same repository/track/branch. A branch is entered in Advanced →
+Update settings → Custom branch using its full upstream name, for example
+`feat/gui-dashboard-improvements`. Saving selects the checking source; choose a
+published release and review separately to install. For a single-container change,
+keep the installed base release selected and choose a compatible build beside
+that container. The other image versions remain on the base (the coordinated
+backup/restart still covers the stack). Keeping the base on `dev` while selecting
+only GUI from `feat/gui-dashboard-improvements` is not currently supported.
+Branch names and matching contracts alone do not bypass that source restriction. Both releases must have the same
+nonempty `component_compatibility[image-family]`, layout, data schema, updater API,
+maintenance API and firmware protocol. The chosen image must support the host's
+platform. Missing/incompatible contracts disable mixing, not whole releases.
+Legacy GUI assets retain `gui_compatibility` fallback only when neither asset has
+a GUI component contract. This published-release selector never accepts raw image references. Cross-source images use the separate Custom images path described below. This is image selection; a GPS/LiDAR driver change still follows the
+installer options and selected release bundle.
+
+### Advanced custom images
+
+**Custom images** starts from the installed stack, even when no release descriptor
+is available. Each installed managed container has **Keep current image** or
+**Choose custom image**. Enter an explicit Docker tag for its current repository,
+a complete `registry/repository:tag`, or `registry/repository@sha256:digest`.
+`https://` and `docker://` prefixes on registry image paths are accepted;
+web pages, embedded credentials, query strings and insecure HTTP URLs are not.
+Use a branch's **published image tag**, not a GitHub branch page. Branch images
+may come from another repository or registry, but must match an accessible published MowgliNext deployment descriptor. Unpublished branch builds and legacy rolling images are rejected.
+Registry authentication uses the updater service account's Docker configuration;
+there is no browser credential form and no extra registry client dependency.
+
+The user acknowledges image trust and unverified compatibility, then chooses
+**Download and review images**. Docker downloads for the host platform without
+starting candidate containers. The returned digest is inspected instead of the
+mutable tag. OCI source/revision/build time, component family, image contract 1,
+release and deployment identifiers are mandatory. The published, non-draft GitHub
+release descriptor must match the image bytes, platform, family, version, source
+revision and firmware protocol. Production uses `vMAJOR.MINOR.PATCH`; dev/custom
+uses `deployment-<12-char-sha>-<run>-<attempt>`. GUI also requires updater UI 1,
+so an old GUI cannot remove the update interface. Missing or forged-looking
+metadata, a tag alone, or an unrelated image named like a release is insufficient.
+The review pins that immutable reference and shows requested names,
+build dates and kept/changed images. A second explicit acknowledgement enables
+installation. A tag does not become an automatic tracking rule. Scheduled checks
+continue checking published deployments from the configured source.
+
+Custom mode changes images only: installed Compose, hardware selection, services,
+mounts and non-selected image IDs are retained. The whole managed stack still
+stops for consistent backup and restarts/verifies together. GUI/ROS candidates and
+installed rollback images must declare maintenance API 1. Wrong architectures,
+untracked image VOLUME storage, pending installer changes, unmanaged/absent services,
+and a changed review baseline are rejected. Existing fresh readiness, mainboard
+protocol verification, backup, rollback and maintenance recovery remain mandatory.
+The complete-deployment publisher supplies the metadata and validates it on both
+architectures before writing an `image_contract: 1` descriptor. Older component-only
+workflows do not qualify simply because they publish a `dev` or semantic-version
+tag. Use a qualifying complete-deployment image/tag or digest; its version label is
+the production release number or immutable snapshot number. The first release
+containing this publisher and GUI marker establishes the minimum support boundary,
+without guessing an unreleased version number.
+
+No cross-release compatibility contract is invented: image authors must be
+trusted, and checks cannot guarantee API/data-format compatibility or safe behavior.
+Custom images have the container's existing access to hardware, Docker and saved
+state; this is stated before download and again before installation.
+
+A verified complete release is **Standard deployment**, including a complete dev
+or custom-branch release. Published per-component overrides or explicit custom
+image selections are **Custom mix**, with base release (if known) and individual image
+provenance. Manual drift and unknown state remain distinct. Even manually choosing
+the same digest stays a custom selection until a complete published deployment is
+reviewed/installed. Simple cannot inherit custom drafts. Installing a published
+release clears custom overrides; successive custom transactions and rollback retain
+and restore the exact previous mix, including installations without a base release.
+The host updater and unmanaged services such as MQTT use their separate paths.
+
+The publisher derives `service_choices` from that bundle. These provide the UI's
+service/image-family/installer-option projection, including newly introduced services.
+Planning compares it with the verified bundle and rejects disagreement. Only managed
+services in the selected target can receive overrides; removed, disabled and local
+services reject them. Older assets without the projection use installed membership
+for the UI; the server remains authoritative.
+
+Other containers follow the selected base. Choose the installed base to retain their
+versions. All managed writers still stop for a consistent backup, then the stack
+restarts and verifies together. The confirmation names every exception and retains
+exact image identities. A deployment pin applies to the whole selected combination;
+checks continue to notify. `POST /v1/plan` accepts `component_deployments`, a map from
+Compose service to published release ID. The legacy `gui_deployment` alias remains
+accepted; specifying GUI in both fields is rejected. Capability
+`service-version-overrides` advertises general selection to clients.
+
+Simple mode always reviews the latest **matched** deployment and never carries a
+hidden Advanced override. **Review update** in Simple (or **Review matched release** in Advanced) clears exceptions after
+successful installation. History and rollback track transaction IDs, base release,
+overrides, image IDs and policy, so two installations sharing the same base release
+can be restored independently. Firmware is not part of a component override.
+
+## Adding a managed or optional container
+
+Each production, dev or custom deployment now carries `mowgli-compose.json`, a
+self-contained bundle of the versioned installer Compose fragments. Its SHA-256
+is pinned by deployment schema 2 in `mowgli-deployment.json`. The shared
+`install/compose/stack.json` map defines required fragments and hardware options:
+
+| Saved installer choice | Selected fragment |
+|---|---|
+| GNSS disabled | No GPS service |
+| Universal GNSS | `docker-compose.gps.yml` |
+| LiDAR disabled | No LiDAR service |
+| LiDAR enabled | The chosen ldlidar/rplidar/stl27l fragment |
+
+The installer and updater use the same Go selector. New required fragments enter
+the reviewed target stack; new optional groups default to an empty `none` choice.
+An unsupported previously selected device blocks the plan instead of silently
+being disabled. Core GUI/ROS2 remain required. The release's selected fragments,
+saved installer options, retained local services and explicit
+`docker/stack-overrides.yaml` produce the desired Compose definition.
+
+`stack-selection.json` records desired hardware options and the identity of the
+membership-related installer `.env` values. `stack-applied-selection.json` records
+what was last applied. Changes to those `.env` choices invalidate an old plan;
+rerun the installer to reconcile them. Ordinary environment/config changes do not
+select extra containers. `.env` references remain live; existing robot YAML,
+calibration, database and maps remain mounted from their current locations.
+
+After a published deployment is installed, installer reruns retain that installed
+bundle and definition, even when the checkout is older. They save changed choices
+for **Review update**, including when staying on the same release. Startup
+continues using the existing definition until the coordinated transaction applies
+the new selection. No hidden removal happens during selection. A rollback restores
+the prior applied selection; a still-requested hardware change remains pending.
+
+The review lists **Add, Remove, Update, Keep** and **Keep / local**. Only containers
+identified by the reviewed project/service/ID may be retired; new containers are
+labelled for ownership-checked rollback removal. There is no broad orphan removal
+and no volume deletion. Local services such as MQTT are preserved and not restarted
+by the update transaction. Existing physical volume/network names are retained for
+the same logical resource keys. Driver/resource changes or new writable storage
+require an explicit migration. Reusing an occupied container name for another
+service is rejected; such renames need separate releases or a migration.
+
+The updater saves the full previous Compose definition, image overrides, environment,
+bundle, selections, local overrides and supported data before activation. Membership
+and immutable image references switch together in one atomic Compose replacement;
+the durable journal can restore them after interruption. Private Compose/recovery
+payloads are removed from browser responses, which expose only choices and changes.
+The generated-file checksum rejects manual edits; reviewed customizations belong in
+`stack-overrides.yaml`. The plain (non-managed) installer records the same checksum
+(`docker/stack-definition.sha256`) for every file it generates, so adoption compares the
+installed file against the baseline it was GENERATED from: an untouched file is adopted
+whatever the fragments became since, an edited one is refused.
+
+A Compose file generated before that baseline existed cannot be told apart from a hand
+edit — comparing it with the new target flags every change the release itself made to the
+fragments (`GNSS_STACK` added to `mowgli.environment`, the rewritten `gps` service, …).
+`installer-stack` therefore exits 3 and lists every differing `service.key`; the installer
+explains it and asks once. On consent (non-interactive: `MOWGLI_ADOPT_LEGACY_COMPOSE=true`)
+the previous file is kept byte-for-byte as `docker-compose.yaml.legacy-<UTC>` and the
+current definition is adopted. Consent never bypasses a recorded checksum.
+
+For an additional first-party service, add its image build definition to
+`install/deployment.json`, add its installer Compose fragment to the required list
+or an optional group in `install/compose/stack.json`, for example:
+
+```yaml
+services:
+  camera:
+    container_name: mowgli-camera
+    image: ghcr.io/mowglinext/mowglinext/camera:dev
+    labels:
+      garden.mowgli.update.image: camera
+      garden.mowgli.update.after: mowgli
+      garden.mowgli.update.health: container
+```
+
+`image` opts in and identifies a declared image family in the release asset.
+`after` is a comma-separated list of installed managed dependencies; missing
+references and cycles reject the plan. Core sensor → ROS2 → GUI ordering cannot
+be disabled. Shutdown reverses that order. `health` supports `container`, `gps`
+and `lidar`; sensor modes additionally require the corresponding fresh application
+observation. Add a Docker healthcheck for a service-specific startup check. Existing
+unlabelled standard installations retain their original role mappings.
+
+Every installed managed service must have a target image for the host architecture
+in the reviewed release. An unknown/missing image fails the plan before pulling or
+stopping containers. Built images must remain in the trusted source's GHCR namespace; explicitly declared external images use their release-approved upstream repository and digest.
+The workflow uses the single build-definition list for its matrix, image merging
+and publication. No updater source edit is needed for a new stateless first-party
+container with an existing health contract.
+
+Persistent services need more care: additional managed services may write only existing writable mounts at the
+already supported data destinations (`/db`, `/mowgli_config`, `/ros2_ws/maps`,
+`/ros2_ws/config`), which are archived and restored. Other writable mounts reject
+the plan. Container writable layers are disposable. Unmanaged containers must not
+write shared managed data. New persistence or application-health contracts require
+an explicit updater implementation and recovery tests; labels are not arbitrary
+backup paths or executable hooks. External image declarations do not expand these storage or health contracts.
+
+`install/deployment.json` also declares `component_compatibility` per image family.
+These are maintainer-reviewed drop-in compatibility promises covering **all consumed
+and provided interfaces**, ROS messages/services/topic semantics, configuration and
+persisted formats. A family with incompatible changes needs a new contract before
+publication; remove its entry to disable mixing when uncertain. GUI retains the
+legacy `gui_compatibility` field for older consumers. Matching dates, tags or firmware
+protocols alone never establish compatibility. Maintaining these promises requires
+mixed-version integration tests, including changed consumers and producers. A new
+service can join whole releases without a contract; it needs one for independent
+version selection.
+
+## External images in standard deployments
+
+`install/deployment.json` accepts two component types. `type: "built"` (also the
+legacy default when omitted) builds from `context`, `file` and optional `target`.
+`type: "external"` approves an existing upstream image without rebuilding or
+relabeling it. Add an entry to `components`, for example (replace placeholders
+with the reviewed upstream version and 64-character SHA-256 index digest):
+
+```json
+{
+  "name": "helper",
+  "type": "external",
+  "image": "docker.io/library/<image-name>",
+  "version": "<approved-upstream-version>",
+  "digest": "sha256:<approved-index-digest>"
+}
+```
+
+Use a canonical repository without tag, scheme or credentials. Public Docker Hub
+(`docker.io/library/name` or `docker.io/owner/name`) and GHCR (`ghcr.io/owner/name`,
+including nested paths) are supported. Other registries and private authenticated
+publication require a separate extension. The digest is mandatory: the publisher
+never resolves `latest` or another floating tag for external components.
+
+Add the service's Compose fragment to the required list or an optional group in
+`install/compose/stack.json`, with `garden.mowgli.update.image: helper` identifying
+this component. Configuration, device access, dependency ordering, health and
+storage are reviewed in that fragment using the same existing constraints as
+built services. A component definition alone does not enable a container.
+The installer continues selecting the same release-owned Compose bundle; no
+separate installer-only container list is introduced.
+
+The workflow excludes external entries from build/merge jobs. Before publishing,
+`publish-deployment --definition ../install/deployment.json` resolves each approved
+index, checks manifest/config hashes and requires both linux/amd64 and linux/arm64.
+It retains original OCI labels, revision, version and build time when supplied,
+and separately records the maintainer-approved upstream `version`. External images
+need not impersonate our source revision, firmware protocol or updater UI labels.
+Core GUI and ROS2 cannot be declared external; their existing updater/maintenance
+requirements remain enforced. All images must validate before the descriptor is
+published. No upstream container code runs during this metadata check.
+
+A release containing external components uses deployment schema 3. Each external
+`images` entry records `type`, approved `version`, upstream `repository`, index
+`digest` and platform manifest/config identities. The trusted MowgliNext release
+approves those exact bytes; upstream labels alone do not establish eligibility.
+Older workers reject the new deployment schema. Journal schema 5 prevents older
+workers from discarding this provenance when saving or recovering state; upgrade
+the worker with the installer/bootstrap path first and preserve its paired state
+backup when reverting to an older worker.
+
+Matching every installed managed image to that release is still **Standard
+deployment**. An external component without an OCI version label displays the
+approved upstream version only after its actual image identity matches the
+installed release (or its recorded component override). Drift does not acquire
+that version. Build dates are never synthesized from publication dates.
+
+Scheduled checks follow complete MowgliNext releases, not upstream tags. A new
+external version is proposed by changing its approved version/digest in the build
+definition and publishing a new deployment. Independent published component choices
+still require the existing compatibility contract. Raw Custom images retain their
+first-party release eligibility rules; declaring an external component does not
+create a general-purpose third-party image installation endpoint.
+
+External services participate in the same reviewed add/update/remove transaction,
+backup, verification and rollback. Existing local services cannot be silently
+adopted. This adds no default MQTT/MAVROS service and does not make their existing
+persistence/hardware integrations update-compatible: MQTT data storage needs a
+reviewed supported migration; MAVROS needs its backend/maintenance integration.
+Before physical use of any new component, follow the acceptance procedure below,
+recording its index/platform/config digests and relevant hardware baseline.
+
+## Recovery and updater self-updates
+
+The durable journal is `/var/lib/mowgli-updater/state.json`. The worker resumes
+interrupted recovery after restart. Settings shows the job phase, error and a
+Retry recovery action. Restore previous deployment restores the last successful
+deployment's saved data too: changes made since that backup are moved aside.
+
+If the GUI cannot start, use SSH:
+
+```sh
+sudo mowgli-updater status
+sudo mowgli-updater recover
+sudo journalctl -u mowgli-updater.service -n 100
+```
+
+### Manual update without the host updater
+
+`install/mowglinext.sh update` (see the wiki's Getting Started) is the
+operator escape hatch when the updater cannot or must not run: it syncs the
+checkout to the chosen branch, regenerates `docker/.env` and the merged
+Compose file from the current fragments with the SAME writers as a fresh
+install (so `docker/stack-definition.sha256` is re-recorded), pulls the images
+for the chosen tag and restarts the containers. It applies no readiness gate,
+no firmware-protocol check and no backup/rollback transaction. An installed
+updater is left running; because nothing is hand-edited it can adopt the
+result, and until the next managed release Settings > Updates reports the
+installation as drifted. Never hand-override images in a Compose override on
+an updater-managed robot instead — that poisons the rollback baseline.
+
+### Protocol-first firmware transitions
+
+Install the GUI and host updater containing the protocol-transition readiness
+contract **before** the next firmware protocol change. After flashing the new
+firmware, review a complete container release whose declared protocol matches
+the live firmware. Maintenance entry may accept `maintenance_ready` from the GUI
+even while the old ROS bridge reports protocol incompatibility. This requires
+fresh firmware, blade and wheel telemetry, idle behavior, stationary wheels,
+and the blade disabled and stopped. The updater rechecks the reviewed protocol
+and the GUI's acknowledgement of the persisted maintenance gate before backup.
+It does not flash firmware or enable motion. Final verification and rollback
+release still require full `ready` compatibility; maintenance-only readiness
+cannot release the mower.
+
+An older GUI without this contract fails closed. A mower already stranded on
+such a GUI needs a controlled administrator bootstrap of matching GUI/ROS images
+under maintenance (or restoration of matching firmware), preserving configuration
+and maps, followed by normal updater verification. Updating the host worker alone
+does not teach an old GUI to provide the new safety verdict. This change is not a
+generic bypass for missing, stale or undecodable hardware telemetry.
+
+Protocol-transition hardware acceptance is **HARDWARE_REQUIRED**; unit/browser
+tests and the earlier manual recovery are not evidence for this automatic path.
+Reference reproduction: unit 192.168.1.118, Yardforce 500B LFP; firmware 1.11.93
+(`Yardforce500B_LFP_DMA_DIAG`, commit `761b5b1c29f9b5a60a54d6b9eee270033591122c`,
+binary SHA256 `a21f81755b6f2dd9929d7eb0622da69bda25f8afc1f456c779d2d87b4aa306b6`),
+protocol 7, with the old protocol-6 ROS image
+`ghcr.io/mowglinext/mowglinext/mowgli-ros2@sha256:5989e016e355942d8fc82a9bbd1fc3ce03526ba438866c51987e2ff75e7a62a1`.
+Use a GUI and host worker containing this change, and record their exact commit,
+image/binary digests, target deployment descriptor, submodule gitlinks and GNSS
+driver/receiver revision before a supervised trial. Published candidate images
+and that hardware run are still outstanding; no robot was changed for this PR.
+
+With blades removed, wheels secured, automatic starts disabled and emergency stop
+accessible, back up configuration/maps and confirm fresh idle, zero-wheel and
+blade-off readings. Review/install the matching protocol-7 container release.
+Pass only if maintenance is acknowledged before writers stop, the reviewed image
+IDs start, configuration/maps are preserved, and full compatible readiness passes
+before maintenance clears. A protocol change after review, missing/stale telemetry,
+motion, data loss, or gate release while incompatible is a failure. On failure,
+retain the gate and evidence; an old protocol-6 rollback cannot release a board
+still on protocol 7 without restoring a genuinely matching software/firmware pair.
+
+Do not remove the maintenance marker to work around a failed recovery. Managed
+`mowgli-*` helpers and `docker/stack.sh` share the updater lock, preserve the image
+override and refuse conflicting lifecycle operations during maintenance. Direct
+administrator Docker commands can bypass that coordination.
+
+The UI also reports the running updater version and offers the selected
+deployment's updater binary. It validates the checksum and version/API probe,
+and journal schema, then stages the replacement. New publications additionally
+carry a platform-specific `build_id`: SHA256 of the worker built without VCS or
+per-release labels. It includes compiled transitive dependencies, toolchain and
+build settings. An unrelated GUI/ROS commit changes the deployment label but
+does not offer the same worker again. The installed worker reports its embedded
+identity, and the downloaded candidate must echo the descriptor's identity as
+well as pass its exact asset checksum check. Older workers/descriptors fall back
+to version comparison, so one initial upgrade can still be offered. This identity
+is for update comparison, not a replacement for download integrity or provenance.
+The installer-managed supervisor starts it and
+requires three successful API health samples. Startup failure or a 45-second
+health timeout restores the previous binary and reports an error. The worker
+cannot replace itself during a container transaction. The supervisor itself is
+refreshed by the normal installer; incompatible API/schema changes require an
+installer migration rather than in-place worker replacement.
+
+The installer checks for pending jobs, maintenance and worker replacement before
+stopping the service. It saves the previous executable and paired journal/selection
+under `installer-backups/` in the updater state directory, atomically replaces the
+launcher, and explicitly selects that worker instead of retaining an older
+self-updated selection. Three matching version/revision/API samples are required
+before marking a new installation managed or retiring its Watchtower instance.
+Schema-crossing recovery uses the retained worker **and its paired journal**;
+restoring only an older executable is unsafe.
+
+Fresh MAVROS, TF-Luna or VESC configurations use the existing installer path and
+keep their selected containers. They are not silently enrolled into coordinated
+updates: the current release selector covers the Mowgli backend, GNSS and LiDAR.
+An already managed installation rejects these unsupported selections before
+regenerating runtime files. These integrations need explicit release/health/storage
+contracts before they can participate in coordinated updates.
+
+Every downloaded target image, including release-approved external images, is
+checked for Dockerfile `VOLUME` declarations against the **target** Compose mounts
+before entering maintenance. Undeclared volumes are rejected before containers
+stop; being absent from Compose does not make image-created storage stateless.
+
+The status/history view retains the most recent 20 completed transactions.
+Recovery data is bounded to the **two most recent rollbacks**: the active
+transaction and the one it replaced, i.e. what two consecutive rollbacks can
+reach. When a transaction finishes (committed or rolled back), and once at worker
+startup, the updater deletes every other `backups/<job>` archive — including the
+`failed-*` data set aside by a rollback that has itself completed — removes the
+matching `mowgli-rollback:<job>-<service>` tags, and deletes the images only
+those tags or the journal kept alive. An image is deleted only if nothing
+retained needs it and no tag names it any more; an operator-tagged image and an
+image a container still uses are left alone. The journal forgets a pruned backup
+before it is deleted, so rollback is never offered against a missing archive.
+Nothing is pruned while a transaction is pending or requires recovery, and a
+capacity failure never triggers deletion of the data that transaction needs.
+
+## Publishing and contributor reference
+
+`.github/workflows/deployment-release.yml` builds the images declared in
+`install/deployment.json` (currently six first-party images) for
+both architectures from the same commit, waits for GUI/ROS2 quality gates, and
+publishes `mowgli-deployment.json`, its checksummed `mowgli-compose.json` bundle
+and updater binaries only when complete. All optional image variants are checked. It
+runs for main/dev/release tags, or by manual dispatch on a custom branch. A fork
+must enable the workflow and publish readable GHCR images and release assets.
+The separate `updater.yml` publishes exact-commit installer bootstrap binaries on
+every branch push (including documentation-only commits) and version-tag push.
+If the asset is unavailable or CI has not finished, supported installation stops
+with an actionable error; it does not enable Watchtower as a fallback. A locally
+built `MOWGLI_UPDATER_BINARY` remains available for unpublished checkouts.
+
+The descriptor is a release asset, not a catalogue service. Firmware and software
+may create the tagged production release in either order; a competing creation
+is accepted only after verifying the release exists. Software uploads its descriptor
+last, after the bundle and binaries, without overwriting firmware assets or an
+existing deployment. Development/custom snapshots use prereleases.
+The picker returns up to 30 deployments, scanning at most 1,000
+release headers. Hitting the scan limit reports an error. Publication and storage
+retention remain maintainer responsibilities. HTTPS and trusted repository
+configuration establish provenance; SHA-256 checks detect corruption, not an
+independent signing authority.
+
+Implementation: `gui/pkg/updater/`, `gui/cmd/mowgli-updater/`,
+`gui/cmd/publish-deployment/`, `gui/pkg/api/updater.go`,
+`gui/web/src/components/settings/HostUpdaterPanel.tsx`, `install/lib/updater.sh`.
+The maintenance helper is
+`ros2/src/mowgli_interfaces/include/mowgli_interfaces/update_maintenance.hpp`.
+HTTP operations are fixed same-origin JSON routes under `/api/system/updater/`,
+proxied to a local Unix socket; no arbitrary Docker command endpoint is exposed.
+
+Tests cover journal recovery, stale plans, persisted checks/notices, source
+validation, API origin/readiness gates, supervisor success/crash recovery and a
+disposable Docker transaction with injected application failure/data rollback.
+Desktop/mobile Playwright cases use fixtures. Physical mower validation and a
+complete published ARM64 deployment remain required before field rollout.
+
+### Journal compatibility
+
+The HTTP API remains version 1 with explicit feature capabilities (`release-compose`
+adds topology planning; `custom-images` adds explicit image selection; `external-images` supports release-approved upstream images; `firmware-protocol-change` accepts `allow_firmware_protocol_change` on plans and `firmware_protocol_acknowledged` on apply; `preexisting-health` adds reviewed optional-component health exceptions). Journal schema 5 preserves external-image type and approved upstream version alongside custom-image provenance and topology recovery payloads. The optional health fields are additive: older workers ignore them and retain strict verification rather than accepting an exception.
+This worker reads schema 1/2/3/4 journals and writes schema 5 on mutation, preserving
+history. Older workers reject schema 5. Self-update probes require schema 5 and
+refuse unsafe worker downgrades. Existing workers using earlier journal schemas require an installer/bootstrap upgrade before using this extension. Deployment schemas 2 and 3 require the Compose bundle; schema 3 adds managed external images and is rejected by older workers.
+legacy schema 1 remains image-only. Workers predating schema 2 releases need the
+installer bootstrap upgrade before discovering those deployments. Keep the current
+worker/backup for recovery; incompatible layouts/data formats require migrations.
+
+### Remaining physical acceptance — HARDWARE_REQUIRED
+
+Software tests and screenshots do not establish physical update acceptance. A
+complete published ARM64 test deployment remains a prerequisite. Before a trial,
+record the exact PR/combined commit, robot unit, firmware binary hash/protocol,
+submodule gitlinks, receiver/driver revisions, Compose configuration, image digests
+and updater checksum. The existing private hardware baseline is not evidence for
+this extension; no robot was changed during this PR extension.
+
+On a parked mower with blade stopped, stationary wheels, no due mission/schedule,
+a supervising operator and physical emergency stop available: install a matched
+release; select compatible ROS2, GUI and an enabled sensor on the same base; verify every resulting image;
+return to matched; test a reviewed cross-branch custom GUI/ROS/sensor mix, repeated custom changes and rollback with/without a published base; return to a standard deployment and verify provenance resets; roll back each transaction; then test an installed optional
+service addition/retirement and failure recovery, checking MQTT identity, retained
+volumes and desired/applied installer selections. Perform a supervised interruption
+test only after
+verifying the manual recovery route and safe power conditions. Pass requires no
+actuation or firmware change, the reviewed image combination, preserved/restored
+data and maintenance retained until application verification. Any unexpected motion,
+image, data loss, stale-observation acceptance or premature gate release is a failure.
+
+
+### Browser build freshness
+
+Every web build emits `web-build.json` with an identity also embedded in its
+JavaScript. The page reads that manifest without caching and compares web-build
+IDs, independently of the Go backend revision. Web-only development patches can
+therefore keep the previous backend without a permanent reload warning. Different
+rebuilds of the same commit still differ. Missing or invalid manifests mean unknown;
+backend source revisions are not a substitute for served-web identity. Deploy the
+manifest and assets together. Diagnostics retain backend, served web and browser
+provenance separately.

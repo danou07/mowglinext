@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.22.1)
 project(mowgli_gnss_bridge)
 
 # ---------------------------------------------------------------------------
@@ -9,7 +9,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -24,7 +24,7 @@ find_package(builtin_interfaces REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(rtcm_msgs REQUIRED)
 find_package(mowgli_interfaces REQUIRED)
-find_package(universal_gnss_ros2 REQUIRED)
+find_package(universal_gnss_msgs REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Library: mowgli_gnss_bridge_lib
@@ -41,14 +41,14 @@ target_include_directories(mowgli_gnss_bridge_lib PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-ament_target_dependencies(mowgli_gnss_bridge_lib
-  rclcpp
-  std_msgs
-  builtin_interfaces
-  diagnostic_msgs
-  rtcm_msgs
-  mowgli_interfaces
-  universal_gnss_ros2
+target_link_libraries(mowgli_gnss_bridge_lib
+  ${rclcpp_TARGETS}
+  ${std_msgs_TARGETS}
+  ${builtin_interfaces_TARGETS}
+  ${diagnostic_msgs_TARGETS}
+  ${rtcm_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
+  ${universal_gnss_msgs_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -63,8 +63,8 @@ target_link_libraries(universal_gnss_topic_bridge
   mowgli_gnss_bridge_lib
 )
 
-ament_target_dependencies(universal_gnss_topic_bridge
-  rclcpp
+target_link_libraries(universal_gnss_topic_bridge
+  ${rclcpp_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -107,12 +107,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_universal_gnss_topic_bridge
     mowgli_gnss_bridge_lib
   )
-  ament_target_dependencies(test_universal_gnss_topic_bridge
-    rclcpp
-    mowgli_interfaces
-    universal_gnss_ros2
-    diagnostic_msgs
-    rtcm_msgs
+  target_link_libraries(test_universal_gnss_topic_bridge
+    ${rclcpp_TARGETS}
+    ${mowgli_interfaces_TARGETS}
+    ${universal_gnss_msgs_TARGETS}
+    ${diagnostic_msgs_TARGETS}
+    ${rtcm_msgs_TARGETS}
   )
 
   ament_add_gtest(test_correction_diagnostic_tracker
@@ -121,9 +121,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_correction_diagnostic_tracker
     mowgli_gnss_bridge_lib
   )
-  ament_target_dependencies(test_correction_diagnostic_tracker
-    diagnostic_msgs
-    mowgli_interfaces
+  target_link_libraries(test_correction_diagnostic_tracker
+    ${diagnostic_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
   )
 
   # C++/Python bridge parity. sensors/CLAUDE.md requires the two bridges to

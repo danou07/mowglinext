@@ -23,13 +23,34 @@
 #include "action_msgs/msg/goal_status.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/quaternion.hpp"
+#include "mowgli_behavior/cancel_goal.hpp"
 #include "rcl_interfaces/srv/set_parameters.hpp"
-#include "tf2/LinearMath/Quaternion.h"
+#include "tf2/LinearMath/Quaternion.hpp"
 #include "tf2/utils.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 namespace mowgli_behavior
 {
+namespace
+{
+
+/// rclcpp_action's result code -> our ROS-free outcome (action_outcome.hpp).
+GoalOutcome OutcomeFromResultCode(const rclcpp_action::ResultCode code)
+{
+  switch (code)
+  {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      return GoalOutcome::kSucceeded;
+    case rclcpp_action::ResultCode::CANCELED:
+      return GoalOutcome::kCanceled;
+    case rclcpp_action::ResultCode::ABORTED:
+    case rclcpp_action::ResultCode::UNKNOWN:
+    default:
+      return GoalOutcome::kAborted;
+  }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -177,7 +198,7 @@ BT::NodeStatus SetNav2Lifecycle::tick()
   // No service client is created and no manage_nodes request is ever sent,
   // so behaviour is identical to a build without idle suspend.
   bool enabled = false;
-  config().blackboard->get<bool>("idle_nav2_suspend", enabled);
+  (void)config().blackboard->get<bool>("idle_nav2_suspend", enabled);
   if (!enabled)
   {
     return BT::NodeStatus::SUCCESS;
@@ -304,6 +325,12 @@ BT::NodeStatus NavigateToPose::onStart()
   goal_msg.pose = target_pose;
 
   auto send_goal_options = rclcpp_action::Client<Nav2Goal>::SendGoalOptions{};
+  // Also ask for the result — see action_outcome.hpp for the lost-status race.
+  outcome_->Reset();
+  send_goal_options.result_callback = [slot = outcome_](const GoalHandle::WrappedResult& result)
+  {
+    slot->Record(OutcomeFromResultCode(result.code));
+  };
 
   goal_handle_future_ = action_client_->async_send_goal(goal_msg, send_goal_options);
   goal_handle_.reset();
@@ -337,7 +364,7 @@ BT::NodeStatus NavigateToPose::onRunning()
     }
   }
 
-  const auto status = goal_handle_->get_status();
+  const auto status = ResolveGoalStatus(goal_handle_->get_status(), outcome_->Get());
 
   switch (status)
   {
@@ -365,7 +392,7 @@ void NavigateToPose::onHalted()
   if (goal_handle_)
   {
     RCLCPP_INFO(ctx->node->get_logger(), "NavigateToPose: canceling active goal");
-    action_client_->async_cancel_goal(goal_handle_);
+    cancelGoalQuietly(action_client_, goal_handle_, ctx->node->get_logger(), "NavigateToPose");
     goal_handle_.reset();
   }
 }
@@ -691,7 +718,10 @@ void NavigateInsideBoundary::onHalted()
   if (goal_handle_)
   {
     RCLCPP_INFO(ctx->node->get_logger(), "NavigateInsideBoundary: canceling goal");
-    action_client_->async_cancel_goal(goal_handle_);
+    cancelGoalQuietly(action_client_,
+                      goal_handle_,
+                      ctx->node->get_logger(),
+                      "NavigateInsideBoundary");
     goal_handle_.reset();
   }
   if (keepout_disabled_)
@@ -791,7 +821,7 @@ void BackUp::onHalted()
   if (goal_handle_)
   {
     auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
-    action_client_->async_cancel_goal(goal_handle_);
+    cancelGoalQuietly(action_client_, goal_handle_, ctx->node->get_logger(), "BackUp");
     RCLCPP_INFO(ctx->node->get_logger(), "BackUp: halted, goal cancelled");
   }
   goal_handle_ = nullptr;
@@ -842,7 +872,7 @@ BT::NodeStatus SetNavMode::tick()
   // Apply the operator-configured speeds (from mowgli_robot.yaml via
   // behavior_tree_node → BTContext), NOT hardcoded magic numbers. We set the
   // knob each controller actually reads: FollowPath is RPP (via RotationShim),
-  // whose speed knob is desired_linear_vel; FollowCoveragePath is FTCController,
+  // whose speed knob is max_linear_vel; FollowCoveragePath is FTCController,
   // whose carrot-speed knob is speed_fast (FTC applies it live via its
   // onParameterChange). Setting vx_max here — the old MPPI knob — would spam
   // "parameter not declared" warnings and silently drop the operator's
@@ -858,7 +888,7 @@ BT::NodeStatus SetNavMode::tick()
       (mode == "precise") ? ctx->mowing_speed : std::max(0.5 * ctx->mowing_speed, kMinDriveSpeed);
 
   const std::vector<rclcpp::Parameter> params = {
-      rclcpp::Parameter("FollowPath.desired_linear_vel", transit),
+      rclcpp::Parameter("FollowPath.primary_controller.max_linear_vel", transit),
       rclcpp::Parameter("FollowCoveragePath.speed_fast", mowing),
   };
 

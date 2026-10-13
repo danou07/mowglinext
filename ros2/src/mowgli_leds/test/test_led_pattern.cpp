@@ -120,6 +120,31 @@ TEST(LedPatternMode, AutonomousWithoutRtkFixedSelectsDegradedMowing)
   EXPECT_EQ(SelectMode(in, MakeCfg()), LedMode::kMowingDegraded);
 }
 
+TEST(LedPatternMode, TransitOutranksBothMowingAndDegradedMowing)
+{
+  LedInputs in = MakeMowingInputs();
+  in.transiting = true;
+
+  in.rtk_fixed = true;
+  EXPECT_EQ(SelectMode(in, MakeCfg()), LedMode::kTransit);
+
+  in.rtk_fixed = false;
+  EXPECT_EQ(SelectMode(in, MakeCfg()), LedMode::kTransit)
+      << "a transit overrides the RTK-fixed distinction too -- coverage "
+         "progress is not advancing right now regardless";
+}
+
+TEST(LedPatternMode, TransitOnlyAppliesInsideTheAutonomousState)
+{
+  // transiting is only ever set true alongside HighLevelStatus's AUTONOMOUS
+  // state (see LedInputs::transiting's doc comment) -- but SelectMode must
+  // not crash or misbehave if some future caller sets it elsewhere.
+  LedInputs in = MakeMowingInputs();
+  in.transiting = true;
+  in.state = HighLevelState::kRecording;
+  EXPECT_EQ(SelectMode(in, MakeCfg()), LedMode::kRecording);
+}
+
 TEST(LedPatternMode, RecordingAndManualMowingMapToTheirOwnModes)
 {
   LedInputs in = MakeMowingInputs();
@@ -309,6 +334,61 @@ TEST(LedPatternRender, DegradedMowingArcIsAmberAndItsHeadBlinks)
   EXPECT_NE(lit, dark);
 }
 
+TEST(LedPatternRender, TransitAlternatesLitHalvesInLightOrange)
+{
+  LedInputs in = MakeMowingInputs();
+  in.transiting = true;
+
+  in.now_s = 0.0;  // blink on -> first half lit
+  const auto first_half = RenderFrame(in, MakeCfg(16u));
+  ASSERT_EQ(first_half.size(), 16u);
+  for (std::size_t i = 0; i < 8u; ++i)
+  {
+    EXPECT_EQ(first_half[i], colors::kLightOrange) << "first-half pixel " << i;
+  }
+  for (std::size_t i = 8; i < 16u; ++i)
+  {
+    EXPECT_EQ(first_half[i], colors::kOff) << "second-half pixel " << i;
+  }
+
+  in.now_s = 0.7;  // blink off (1 s period) -> second half lit
+  const auto second_half = RenderFrame(in, MakeCfg(16u));
+  for (std::size_t i = 0; i < 8u; ++i)
+  {
+    EXPECT_EQ(second_half[i], colors::kOff) << "first-half pixel " << i;
+  }
+  for (std::size_t i = 8; i < 16u; ++i)
+  {
+    EXPECT_EQ(second_half[i], colors::kLightOrange) << "second-half pixel " << i;
+  }
+
+  // The two frames must differ, or the node's change detector would never
+  // push the alternation to the wire.
+  EXPECT_NE(first_half, second_half);
+}
+
+// The requirement was explicitly "respect however many LEDs are configured,
+// split into two halves" -- pin it against a count that is neither 16 nor
+// even, so integer division handing the extra pixel to the second half is
+// exercised, not just the common 16-LED case above.
+TEST(LedPatternRender, TransitRespectsAnOddConfiguredLedCount)
+{
+  LedInputs in = MakeMowingInputs();
+  in.transiting = true;
+  in.now_s = 0.0;  // blink on -> first half lit
+
+  const auto pixels = RenderFrame(in, MakeCfg(29u));
+  ASSERT_EQ(pixels.size(), 29u);
+  for (std::size_t i = 0; i < 14u; ++i)
+  {
+    EXPECT_EQ(pixels[i], colors::kLightOrange) << "first-half pixel " << i;
+  }
+  for (std::size_t i = 14; i < 29u; ++i)
+  {
+    EXPECT_EQ(pixels[i], colors::kOff) << "second-half pixel " << i << " (gets the extra one)";
+  }
+}
+
 TEST(LedPatternRender, ChargingFillsProportionallyToBatteryAndBreathes)
 {
   LedInputs in;
@@ -434,6 +514,90 @@ TEST(LedPatternRender, ChargeCompleteTimeoutOfZeroDisablesDimmingEntirely)
   {
     EXPECT_EQ(pixel, colors::kGreen);
   }
+}
+
+TEST(LedPatternRender, ChargeCompleteIndicatorCountKeepsEvenlySpacedPixelsLit)
+{
+  LedInputs in;
+  in.status_fresh = true;
+  in.state = HighLevelState::kIdle;
+  in.is_charging = true;
+  in.battery_valid = true;
+  in.battery_percent = 100.0f;
+  in.charge_complete_elapsed_s = 1000.0;
+
+  LedPatternCfg cfg = MakeCfg();  // led_count = 16
+  cfg.charge_complete_dim_scale = 0.0f;
+  cfg.charge_complete_indicator_count = 4u;  // 16 / 4 = every 4th pixel
+  cfg.charge_complete_indicator_scale = 0.5f;
+  const auto pixels = RenderFrame(in, cfg);
+
+  EXPECT_EQ(CountLit(pixels), 4u) << "exactly the requested count stays lit, no more";
+  for (const std::size_t idx : {0u, 4u, 8u, 12u})
+  {
+    EXPECT_GT(pixels[idx].g, 0u) << "pixel " << idx << " should be an indicator pixel";
+  }
+  EXPECT_EQ(pixels[1], colors::kOff) << "a non-indicator pixel must stay at the (0) dim scale";
+}
+
+TEST(LedPatternRender, ChargeCompleteIndicatorIdsTakePriorityOverCount)
+{
+  LedInputs in;
+  in.status_fresh = true;
+  in.state = HighLevelState::kIdle;
+  in.is_charging = true;
+  in.battery_valid = true;
+  in.battery_percent = 100.0f;
+  in.charge_complete_elapsed_s = 1000.0;
+
+  LedPatternCfg cfg = MakeCfg();
+  cfg.charge_complete_dim_scale = 0.0f;
+  cfg.charge_complete_indicator_count = 4u;  // would light 0,4,8,12 if honoured
+  cfg.charge_complete_indicator_ids = {2u, 9u};  // must win instead, count is ignored
+  const auto pixels = RenderFrame(in, cfg);
+
+  EXPECT_EQ(CountLit(pixels), 2u);
+  EXPECT_NE(pixels[2], colors::kOff);
+  EXPECT_NE(pixels[9], colors::kOff);
+  EXPECT_EQ(pixels[0], colors::kOff) << "count-based spacing must not apply once ids is set";
+  EXPECT_EQ(pixels[4], colors::kOff);
+}
+
+TEST(LedPatternRender, ChargeCompleteIndicatorIdsIgnoresOutOfRangeIndices)
+{
+  LedInputs in;
+  in.status_fresh = true;
+  in.state = HighLevelState::kIdle;
+  in.is_charging = true;
+  in.battery_valid = true;
+  in.battery_percent = 100.0f;
+  in.charge_complete_elapsed_s = 1000.0;
+
+  LedPatternCfg cfg = MakeCfg();  // led_count = 16
+  cfg.charge_complete_dim_scale = 0.0f;
+  cfg.charge_complete_indicator_ids = {3u, 999u};  // 999 is out of range
+  const auto pixels = RenderFrame(in, cfg);
+
+  EXPECT_EQ(CountLit(pixels), 1u) << "an out-of-range id must be dropped, not crash or wrap";
+  EXPECT_NE(pixels[3], colors::kOff);
+}
+
+TEST(LedPatternRender, ChargeCompleteIndicatorCountBeyondLedCountLightsWholeRing)
+{
+  LedInputs in;
+  in.status_fresh = true;
+  in.state = HighLevelState::kIdle;
+  in.is_charging = true;
+  in.battery_valid = true;
+  in.battery_percent = 100.0f;
+  in.charge_complete_elapsed_s = 1000.0;
+
+  LedPatternCfg cfg = MakeCfg();  // led_count = 16
+  cfg.charge_complete_dim_scale = 0.0f;
+  cfg.charge_complete_indicator_count = 999u;  // far more than led_count
+  const auto pixels = RenderFrame(in, cfg);
+
+  EXPECT_EQ(CountLit(pixels), 16u) << "clamped to led_count, not a crash or an out-of-bounds write";
 }
 
 TEST(LedPatternRender, LowBatteryBlinksTheWholeRingBetweenRedAndOff)

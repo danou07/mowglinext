@@ -3,6 +3,7 @@ import { Alert, Card, Col, Form, InputNumber, Row, Select, Space, Switch, Typogr
 import { DashboardOutlined, ScissorOutlined } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import { useThemeMode } from "../../theme/ThemeContext.tsx";
+import {CrossHatchSettings} from "./CrossHatchSettings.tsx";
 import { SettingFieldLabel } from "./SettingFieldLabel.tsx";
 
 const { Text, Paragraph } = Typography;
@@ -25,10 +26,15 @@ const HEADLAND_PASSES_NONE = -1;
 const HEADLAND_PASSES_AUTO = 0;
 const HEADLAND_PASSES_MAX = 5;
 // The installed mowgli_robot.yaml is SPARSE (Invariant 15), so an untouched
-// robot sends no num_headland_passes at all. Fall back to the TEMPLATE default
-// (ros2/src/mowgli_bringup/config/mowgli_robot.yaml) — the value coverage_server
+// robot sends no num_headland_passes at all. Fall back to the schema/template
+// default (mower_config.schema.json, mirroring
+// ros2/src/mowgli_bringup/config/mowgli_robot.yaml) — the value coverage_server
 // actually runs — not to AUTO, which would show a ring count nobody is using.
-const HEADLAND_PASSES_TEMPLATE_DEFAULT = 2;
+// Used only before `defaults` has loaded (or if the key is ever absent from
+// it); once loaded, `defaults.num_headland_passes` is the source of truth so
+// this can never drift from the schema again (maintainer review on PR #598:
+// this literal had gone stale at 2 while the schema/template moved to 5).
+const HEADLAND_PASSES_FALLBACK_DEFAULT = 5;
 const HEADLAND_PASS_OPTIONS = [
     HEADLAND_PASSES_NONE,
     HEADLAND_PASSES_AUTO,
@@ -54,6 +60,11 @@ type Props = {
     isOverridden?: (key: string) => boolean;
     hasDefault?: (key: string) => boolean;
     onReset?: (key: string) => void;
+    // Schema/template defaults (useSettingsManager's `defaults`), keyed by
+    // yaml key — the same map hasDefault/isOverridden/onReset already read.
+    // Used ONLY to derive HEADLAND_PASSES_FALLBACK_DEFAULT's replacement from
+    // the schema instead of a literal that can drift from it.
+    defaults?: Record<string, any>;
 };
 
 /** Mini SVG preview showing the strip pattern. Spacing == tool_width (F2C
@@ -181,6 +192,7 @@ export const MowingSection: React.FC<Props> = ({
     isOverridden,
     hasDefault,
     onReset,
+    defaults,
 }) => {
     const { t } = useTranslation();
     const fieldLabel = (key: string, label: React.ReactNode) => (
@@ -198,6 +210,16 @@ export const MowingSection: React.FC<Props> = ({
     const pathSpacing = values.tool_width ?? 0.18;
     const toolWidth = values.tool_width ?? 0.18;
     const headlandWidth = values.headland_width ?? 0.18;
+    // Turn-Around Headland Limit only makes sense against a FORCED ring count
+    // (num_headland_passes > 0) — with AUTO (0) the actual ring count is not
+    // known until a plan runs, and with NONE (negative) there are no rings to
+    // bound turns against at all. Falls back to the schema default (via
+    // `defaults`, so this can never drift from mower_config.schema.json /
+    // the ROS2 template the way the old hardcoded literal did), so the option
+    // list matches what coverage_server actually plans against on a sparse
+    // (untouched) robot.
+    const currentHeadlandPasses =
+        values.num_headland_passes ?? defaults?.num_headland_passes ?? HEADLAND_PASSES_FALLBACK_DEFAULT;
     // AUTO is modelled as a negative sentinel (-1). The Auto switch toggles
     // between the sentinel and a concrete 0..179° angle; the degrees input is
     // disabled while Auto is on.
@@ -233,15 +255,29 @@ export const MowingSection: React.FC<Props> = ({
                             </Paragraph>
                         </div>
                         <Switch
+                            aria-label={t("settingsMowing.mowingMotor")}
                             checked={values.mowing_enabled ?? true}
                             onChange={(v) => onChange("mowing_enabled", v)}
+                        />
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16 }}>
+                        <div>
+                            {fieldLabel("blade_auto_reverse", <Text strong>{t("settingsMowing.bladeAutoReverse")}</Text>)}
+                            <Paragraph type="secondary" style={{ margin: "4px 0 0" }}>
+                                {t("settingsMowing.bladeAutoReverseDescription")}
+                            </Paragraph>
+                        </div>
+                        <Switch
+                            aria-label={t("settingsMowing.bladeAutoReverse")}
+                            checked={values.blade_auto_reverse ?? false}
+                            onChange={(v) => onChange("blade_auto_reverse", v)}
                         />
                     </div>
                     <Form layout="vertical" size="small">
                         <Row gutter={[16, 0]}>
                             <Col xs={12} sm={8}>
-                                <Form.Item label={fieldLabel("mowing_speed", t("settingsMowing.mowingSpeed"))} tooltip={t("settingsMowing.mowingSpeedTooltip")}>
-                                    <InputNumber
+                                <Form.Item htmlFor="setting-mowing_speed" data-setting-key="mowing_speed" label={fieldLabel("mowing_speed", t("settingsMowing.mowingSpeed"))} tooltip={t("settingsMowing.mowingSpeedTooltip")}>
+                                    <InputNumber aria-label={t("settingsMowing.mowingSpeed") + ", m/s"} aria-description={t("settingsMowing.mowingSpeedTooltip")}  id="setting-mowing_speed"
                                         value={values.mowing_speed}
                                         onChange={(v) => onChange("mowing_speed", v)}
                                         min={0.05} max={0.6} step={0.05} precision={2}
@@ -250,8 +286,8 @@ export const MowingSection: React.FC<Props> = ({
                                 </Form.Item>
                             </Col>
                             <Col xs={12} sm={8}>
-                                <Form.Item label={fieldLabel("transit_speed", t("settingsMowing.transitSpeed"))} tooltip={t("settingsMowing.transitSpeedTooltip")}>
-                                    <InputNumber
+                                <Form.Item htmlFor="setting-transit_speed" data-setting-key="transit_speed" label={fieldLabel("transit_speed", t("settingsMowing.transitSpeed"))} tooltip={t("settingsMowing.transitSpeedTooltip")}>
+                                    <InputNumber aria-label={t("settingsMowing.transitSpeed") + ", m/s"} aria-description={t("settingsMowing.transitSpeedTooltip")}  id="setting-transit_speed"
                                         value={values.transit_speed}
                                         onChange={(v) => onChange("transit_speed", v)}
                                         min={0.05} max={0.6} step={0.05} precision={2}
@@ -294,6 +330,7 @@ export const MowingSection: React.FC<Props> = ({
                             <Col xs={12} sm={8}>
                                 <Form.Item label={fieldLabel("blade_load_rpm_full", t("settingsMowing.bladeLoadRpmFull"))} tooltip={t("settingsMowing.bladeLoadRpmFullTooltip")}>
                                     <InputNumber
+                                        aria-label={t("settingsMowing.bladeLoadRpmFull") + ", rpm"}
                                         value={bladeLoadRpmFull}
                                         onChange={(v) => onChange("blade_load_rpm_full", v)}
                                         disabled={!bladeLoadEnabled}
@@ -305,6 +342,7 @@ export const MowingSection: React.FC<Props> = ({
                             <Col xs={12} sm={8}>
                                 <Form.Item label={fieldLabel("blade_load_rpm_min", t("settingsMowing.bladeLoadRpmMin"))} tooltip={t("settingsMowing.bladeLoadRpmMinTooltip")}>
                                     <InputNumber
+                                        aria-label={t("settingsMowing.bladeLoadRpmMin") + ", rpm"}
                                         value={bladeLoadRpmMin}
                                         onChange={(v) => onChange("blade_load_rpm_min", v)}
                                         disabled={!bladeLoadEnabled}
@@ -314,8 +352,8 @@ export const MowingSection: React.FC<Props> = ({
                                 </Form.Item>
                             </Col>
                             <Col xs={12} sm={8}>
-                                <Form.Item label={fieldLabel("blade_load_min_speed_ratio", t("settingsMowing.bladeLoadMinSpeedRatio"))} tooltip={t("settingsMowing.bladeLoadMinSpeedRatioTooltip")}>
-                                    <InputNumber
+                                <Form.Item htmlFor="setting-blade_load_min_speed_ratio" data-setting-key="blade_load_min_speed_ratio" label={fieldLabel("blade_load_min_speed_ratio", t("settingsMowing.bladeLoadMinSpeedRatio"))} tooltip={t("settingsMowing.bladeLoadMinSpeedRatioTooltip")}>
+                                    <InputNumber aria-label={t("settingsMowing.bladeLoadMinSpeedRatio")} aria-description={t("settingsMowing.bladeLoadMinSpeedRatioTooltip")}  id="setting-blade_load_min_speed_ratio"
                                         value={values.blade_load_min_speed_ratio ?? BLADE_LOAD_MIN_SPEED_RATIO_DEFAULT}
                                         onChange={(v) => onChange("blade_load_min_speed_ratio", v)}
                                         disabled={!bladeLoadEnabled}
@@ -336,8 +374,8 @@ export const MowingSection: React.FC<Props> = ({
                         <Form layout="vertical" size="small">
                             <Row gutter={[16, 0]}>
                                 <Col xs={12}>
-                                    <Form.Item label={fieldLabel("headland_width", t("settingsMowing.headlandWidth"))} tooltip={t("settingsMowing.headlandWidthTooltip")}>
-                                        <InputNumber
+                                    <Form.Item htmlFor="setting-headland_width" data-setting-key="headland_width" label={fieldLabel("headland_width", t("settingsMowing.headlandWidth"))} tooltip={t("settingsMowing.headlandWidthTooltip")}>
+                                        <InputNumber aria-label={t("settingsMowing.headlandWidth") + ", m"} aria-description={t("settingsMowing.headlandWidthTooltip")}  id="setting-headland_width"
                                             value={values.headland_width}
                                             onChange={(v) => onChange("headland_width", v)}
                                             min={0} max={1.0} step={0.05} precision={2}
@@ -348,7 +386,7 @@ export const MowingSection: React.FC<Props> = ({
                                 <Col xs={12}>
                                     <Form.Item label={fieldLabel("num_headland_passes", t("settingsMowing.headlandPasses"))} tooltip={t("settingsMowing.headlandPassesTooltip")}>
                                         <Select
-                                            value={values.num_headland_passes ?? HEADLAND_PASSES_TEMPLATE_DEFAULT}
+                                            value={currentHeadlandPasses}
                                             onChange={(v) => onChange("num_headland_passes", v)}
                                             style={{ width: "100%" }}
                                             options={HEADLAND_PASS_OPTIONS.map((value) => ({
@@ -364,8 +402,26 @@ export const MowingSection: React.FC<Props> = ({
                                     </Form.Item>
                                 </Col>
                                 <Col xs={12}>
-                                    <Form.Item label={fieldLabel("chassis_safety_inset", t("settingsMowing.chassisSafetyInset"))} tooltip={t("settingsMowing.chassisSafetyInsetTooltip")}>
-                                        <InputNumber
+                                    <Form.Item htmlFor="setting-connector_max_headland_passes" data-setting-key="connector_max_headland_passes" label={fieldLabel("connector_max_headland_passes", t("settingsMowing.connectorMaxHeadlandPasses"))} tooltip={t("settingsMowing.connectorMaxHeadlandPassesTooltip")}>
+                                        <Select id="setting-connector_max_headland_passes"
+                                            value={values.connector_max_headland_passes ?? 0}
+                                            onChange={(v) => onChange("connector_max_headland_passes", v)}
+                                            style={{ width: "100%" }}
+                                            disabled={currentHeadlandPasses <= 0}
+                                            virtual={false}
+                                            options={[
+                                                { value: 0, label: t("settingsMowing.connectorMaxHeadlandPassesUnlimited") },
+                                                ...Array.from({ length: Math.max(currentHeadlandPasses, 0) }, (_, i) => i + 1).map((value) => ({
+                                                    value,
+                                                    label: String(value),
+                                                })),
+                                            ]}
+                                        />
+                                    </Form.Item>
+                                </Col>
+                                <Col xs={12}>
+                                    <Form.Item htmlFor="setting-chassis_safety_inset" data-setting-key="chassis_safety_inset" label={fieldLabel("chassis_safety_inset", t("settingsMowing.chassisSafetyInset"))} tooltip={t("settingsMowing.chassisSafetyInsetTooltip")}>
+                                        <InputNumber aria-label={t("settingsMowing.chassisSafetyInset") + ", m"} aria-description={t("settingsMowing.chassisSafetyInsetTooltip")}  id="setting-chassis_safety_inset"
                                             value={values.chassis_safety_inset}
                                             onChange={(v) => onChange("chassis_safety_inset", v)}
                                             min={0} max={0.5} step={0.01} precision={2}
@@ -374,8 +430,8 @@ export const MowingSection: React.FC<Props> = ({
                                     </Form.Item>
                                 </Col>
                                 <Col xs={12}>
-                                    <Form.Item label={fieldLabel("min_turning_radius", t("settingsMowing.minTurningRadius"))} tooltip={t("settingsMowing.minTurningRadiusTooltip")}>
-                                        <InputNumber
+                                    <Form.Item htmlFor="setting-min_turning_radius" data-setting-key="min_turning_radius" label={fieldLabel("min_turning_radius", t("settingsMowing.minTurningRadius"))} tooltip={t("settingsMowing.minTurningRadiusTooltip")}>
+                                        <InputNumber aria-label={t("settingsMowing.minTurningRadius") + ", m"} aria-description={t("settingsMowing.minTurningRadiusTooltip")}  id="setting-min_turning_radius"
                                             value={values.min_turning_radius}
                                             onChange={(v) => onChange("min_turning_radius", v)}
                                             min={0.05} max={1.0} step={0.01} precision={2}
@@ -384,8 +440,8 @@ export const MowingSection: React.FC<Props> = ({
                                     </Form.Item>
                                 </Col>
                                 <Col xs={12}>
-                                    <Form.Item label={fieldLabel("swath_overlap", t("settingsMowing.swathOverlap"))} tooltip={t("settingsMowing.swathOverlapTooltip")}>
-                                        <InputNumber
+                                    <Form.Item htmlFor="setting-swath_overlap" data-setting-key="swath_overlap" label={fieldLabel("swath_overlap", t("settingsMowing.swathOverlap"))} tooltip={t("settingsMowing.swathOverlapTooltip")}>
+                                        <InputNumber aria-label={t("settingsMowing.swathOverlap") + ", m"} aria-description={t("settingsMowing.swathOverlapTooltip")}  id="setting-swath_overlap"
                                             value={values.swath_overlap}
                                             onChange={(v) => onChange("swath_overlap", v)}
                                             min={0} max={0.2} step={0.01} precision={3}
@@ -394,8 +450,8 @@ export const MowingSection: React.FC<Props> = ({
                                     </Form.Item>
                                 </Col>
                                 <Col xs={12}>
-                                    <Form.Item label={fieldLabel("mow_direction", t("settingsMowing.mowDirection"))} tooltip={t("settingsMowing.mowDirectionTooltip")}>
-                                        <Select
+                                    <Form.Item htmlFor="setting-mow_direction" data-setting-key="mow_direction" label={fieldLabel("mow_direction", t("settingsMowing.mowDirection"))} tooltip={t("settingsMowing.mowDirectionTooltip")}>
+                                        <Select id="setting-mow_direction"
                                             value={values.mow_direction ?? 0}
                                             onChange={(v) => onChange("mow_direction", v)}
                                             style={{ width: "100%" }}
@@ -404,6 +460,15 @@ export const MowingSection: React.FC<Props> = ({
                                                 { value: 1, label: t("settingsMowing.mowDirectionCw") },
                                                 { value: 2, label: t("settingsMowing.mowDirectionCcw") },
                                             ]}
+                                        />
+                                    </Form.Item>
+                                </Col>
+                                <Col xs={12}>
+                                    <Form.Item htmlFor="setting-mow_cross_hatch" data-setting-key="mow_cross_hatch" label={fieldLabel("mow_cross_hatch", t("settingsMowing.crossHatch"))} tooltip={t("settingsMowing.crossHatchTooltip")}>
+                                        <Switch id="setting-mow_cross_hatch"
+                                            aria-label={t("settingsMowing.crossHatch")}
+                                            checked={values.mow_cross_hatch ?? false}
+                                            onChange={(v) => onChange("mow_cross_hatch", v)}
                                         />
                                     </Form.Item>
                                 </Col>
@@ -417,6 +482,7 @@ export const MowingSection: React.FC<Props> = ({
                                                 onChange={(auto) => onChange("mow_angle_deg", auto ? MOW_ANGLE_AUTO : 0)}
                                             />
                                             <InputNumber
+                                                aria-label={t("settingsMowing.mowAngle")}
                                                 value={mowAngleIsAuto ? undefined : values.mow_angle_deg}
                                                 onChange={(v) => onChange("mow_angle_deg", v ?? 0)}
                                                 disabled={mowAngleIsAuto}
@@ -441,6 +507,7 @@ export const MowingSection: React.FC<Props> = ({
                         />
                     </Col>
                 </Row>
+                {values.mow_cross_hatch && <CrossHatchSettings angle={values.mow_angle_deg ?? MOW_ANGLE_AUTO}/>}
             </Card>
         </div>
     );

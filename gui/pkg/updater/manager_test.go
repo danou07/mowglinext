@@ -1,0 +1,536 @@
+package updater
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/mowglinext/mowglinext/pkg/updates"
+)
+
+type fakeBackend struct {
+	mu               sync.Mutex
+	events           []string
+	fail             string
+	fingerprint      string
+	recoveryWarnings []string
+	// firmwareProtocol is what the mainboard reports (0 = no handshake yet).
+	firmwareProtocol int
+	// gateChanges and verifyChanges record the FirmwareProtocolChange each
+	// maintenance gate and verification was told to expect.
+	gateChanges     []*FirmwareProtocolChange
+	verifyChanges   []*FirmwareProtocolChange
+	healthSnapshots [][]HealthIssue
+	healthCalls     int
+	verifiedHealth  [][]HealthIssue
+}
+
+func (b *fakeBackend) RunningFirmwareProtocol(context.Context) (int, error) {
+	if b.firmwareProtocol == 0 {
+		return 6, nil
+	}
+	return b.firmwareProtocol, nil
+}
+
+func (b *fakeBackend) event(s string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.events = append(b.events, s)
+	if b.fail == s {
+		return errors.New("injected " + s)
+	}
+	return nil
+}
+func (b *fakeBackend) Inventory(context.Context) (string, map[string]string, error) {
+	return b.fingerprint, map[string]string{"gui": "old-gui", "mowgli": "old-ros"}, b.event("inventory")
+}
+func (b *fakeBackend) PlanImages(context.Context, Deployment, PlanOptions) (map[string]string, error) {
+	return map[string]string{"gui": "new-gui", "mowgli": "new-ros"}, nil
+}
+func (b *fakeBackend) Pull(context.Context, map[string]string) error { return b.event("pull") }
+func (b *fakeBackend) Maintenance(_ context.Context, active bool) error {
+	if active {
+		b.mu.Lock()
+		b.gateChanges = append(b.gateChanges, nil)
+		b.mu.Unlock()
+		return b.event("gate")
+	}
+	return b.event("ungate")
+}
+
+// PrepareUpdate is the maintenance entry that knows the reviewed plan; it
+// records the FirmwareProtocolChange the gate was told to expect.
+func (b *fakeBackend) PrepareUpdate(_ context.Context, p Plan) error {
+	b.mu.Lock()
+	b.gateChanges = append(b.gateChanges, p.FirmwareProtocolChange)
+	b.mu.Unlock()
+	return b.event("gate")
+}
+func (b *fakeBackend) Backup(context.Context, string) (string, error) {
+	return "backup", b.event("backup")
+}
+func (b *fakeBackend) Apply(_ context.Context, images map[string]string) error {
+	if images["gui"] == "old-gui" {
+		return b.event("apply-old")
+	}
+	return b.event("apply-new")
+}
+func (b *fakeBackend) Verify(ctx context.Context, images map[string]string, _ *Deployment, change *FirmwareProtocolChange) error {
+	b.mu.Lock()
+	b.verifyChanges = append(b.verifyChanges, change)
+	if allowance := healthVerificationFromContext(ctx); allowance != nil {
+		b.verifiedHealth = append(b.verifiedHealth, append([]HealthIssue(nil), allowance.Allowed...))
+		allowance.Remaining = append([]HealthIssue(nil), allowance.Allowed...)
+	}
+	b.mu.Unlock()
+	if images["gui"] == "old-gui" {
+		return b.event("verify-old")
+	}
+	return b.event("verify-new")
+}
+func (b *fakeBackend) PreexistingHealthIssues(context.Context, map[string]string) ([]HealthIssue, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.healthSnapshots) == 0 {
+		return nil, nil
+	}
+	index := b.healthCalls
+	if index >= len(b.healthSnapshots) {
+		index = len(b.healthSnapshots) - 1
+	}
+	b.healthCalls++
+	return append([]HealthIssue(nil), b.healthSnapshots[index]...), nil
+}
+func (b *fakeBackend) VerifyRecovery(ctx context.Context, images map[string]string, d *Deployment, change *FirmwareProtocolChange) ([]string, error) {
+	return b.recoveryWarnings, b.Verify(ctx, images, d, change)
+}
+func (b *fakeBackend) Restore(context.Context, string) error { return b.event("restore") }
+
+type fakeSource struct {
+	calls    int
+	releases []Deployment
+	err      error
+}
+
+type ungatedBackend struct{ *fakeBackend }
+
+func (ungatedBackend) MaintenanceSet() (bool, error) { return false, nil }
+
+func TestRecoveryBeforeMaintenanceNeverRestartsMower(t *testing.T) {
+	m, b, _ := setup(t, "gate")
+	m.backend = ungatedBackend{b}
+	p, err := m.MakePlan(context.Background(), fixture().ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Start(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if settled(t, m).Job.Phase != "recovery_required" {
+		t.Fatal("expected rejected readiness")
+	}
+	m.Recover()
+	if settled(t, m).Job.Phase != "failed" {
+		t.Fatal("expected untouched installation")
+	}
+	for _, event := range b.events {
+		if strings.HasPrefix(event, "apply-") || event == "restore" || event == "backup" {
+			t.Fatal("changed mower without entering maintenance", b.events)
+		}
+	}
+}
+
+func (s *fakeSource) List(context.Context, Source) ([]Deployment, error) {
+	s.calls++
+	return s.releases, s.err
+}
+func fixture() Deployment {
+	d := Deployment{Schema: 1, ID: "deployment-123", Source: Source{Repository: "mowglinext/mowglinext", Track: "dev", Branch: "dev"}, Revision: strings.Repeat("a", 40), ReleaseTag: "deployment-123", PublishedAt: time.Now().UTC(), Layout: 1, DataSchema: 1, UpdaterAPI: 1, MaintenanceAPI: 1, FirmwareProtocol: 6, Images: map[string]updates.Image{}}
+	for _, name := range []string{"gps", "mowgli-ros2", "mowglinext-gui"} {
+		d.Images[name] = updates.Image{Repository: "ghcr.io/mowglinext/mowglinext/" + name, Digest: "sha256:" + strings.Repeat("b", 64), Platforms: map[string]updates.Platform{"linux/arm64": {Manifest: "sha256:" + strings.Repeat("c", 64), Config: "sha256:" + strings.Repeat("d", 64), Revision: d.Revision}}}
+	}
+	return d
+}
+func setup(t *testing.T, fail string) (*Manager, *fakeBackend, *fakeSource) {
+	t.Helper()
+	b := &fakeBackend{fail: fail, fingerprint: "original"}
+	s := &fakeSource{releases: []Deployment{fixture()}}
+	m, err := Open(t.TempDir(), []string{"mowglinext/mowglinext"}, b, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = m.Check(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	return m, b, s
+}
+func settled(t *testing.T, m *Manager) State {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		busy := m.busy
+		m.mu.Unlock()
+		if !busy {
+			return m.Snapshot()
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("job did not settle")
+	return State{}
+}
+func TestScheduledChecksPersistAndDoNotRunOnReads(t *testing.T) {
+	m, _, s := setup(t, "")
+	for i := 0; i < 5; i++ {
+		m.Snapshot()
+		_ = m.Check(context.Background(), false)
+	}
+	if s.calls != 1 {
+		t.Fatal("cached reads caused checks")
+	}
+	reopened, e := Open(filepath.Dir(m.path), m.trusted, m.backend, s)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_ = reopened.Check(context.Background(), false)
+	if s.calls != 1 {
+		t.Fatal("restart ignored persisted due time")
+	}
+	if reopened.Snapshot().LastSuccess.IsZero() {
+		t.Fatal("lost cached success")
+	}
+}
+func TestNotificationAcknowledgementSurvivesRestart(t *testing.T) {
+	m, _, _ := setup(t, "")
+	n := m.Snapshot().Notices[0]
+	if err := m.Acknowledge(n.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	m2, e := Open(filepath.Dir(m.path), m.trusted, m.backend, m.source)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !m2.Snapshot().Notices[0].Dismissed {
+		t.Fatal("dismissal lost")
+	}
+}
+func TestCorruptStateIsNotReset(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "state.json"), []byte("{"), 0600)
+	if _, err := Open(dir, []string{"mowglinext/mowglinext"}, nil, nil); err == nil {
+		t.Fatal("corrupt recovery state accepted")
+	}
+}
+
+func TestCorruptBackupRejectedBeforeDockerOrDataChanges(t *testing.T) {
+	dir := t.TempDir()
+	backup := filepath.Join(dir, "backups", "saved")
+	if err := AtomicJSON(filepath.Join(backup, "backup.json"), backupRecord{Sources: []string{"/must-not-touch"}, Checksums: []string{strings.Repeat("0", 64)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backup, "0.tar"), []byte("corrupt archive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	b := DockerBackend{HostConfig{StateDir: dir}}
+	if err := b.Restore(context.Background(), backup); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("expected rejection before Docker or data operations: %v", err)
+	}
+}
+func TestInstallAndFailures(t *testing.T) {
+	for _, test := range []struct {
+		fail, phase string
+		must, never []string
+	}{
+		{"", "succeeded", []string{"pull", "gate", "backup", "apply-new", "verify-new", "ungate"}, []string{"restore"}},
+		{"pull", "failed", nil, []string{"gate", "backup", "apply-new"}},
+		{"backup", "recovery_required", []string{"gate"}, []string{"apply-new", "ungate"}},
+		{"apply-new", "rolled_back", []string{"restore", "apply-old", "verify-old", "ungate"}, nil},
+		{"verify-new", "rolled_back", []string{"restore", "apply-old", "verify-old", "ungate"}, nil},
+	} {
+		t.Run(test.fail+test.phase, func(t *testing.T) {
+			m, b, _ := setup(t, test.fail)
+			p, e := m.MakePlan(context.Background(), fixture().ID, true)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if _, e = m.Start(p.ID); e != nil {
+				t.Fatal(e)
+			}
+			s := settled(t, m)
+			if s.Job.Phase != test.phase {
+				t.Fatalf("%s: %s", s.Job.Phase, s.Job.Error)
+			}
+			if test.phase == "rolled_back" {
+				if !strings.Contains(s.Job.Error, "injected "+test.fail) || len(s.History) == 0 || s.History[len(s.History)-1].Error != s.Job.Error {
+					t.Fatalf("rollback lost the original failure in job/history: %+v", s.Job)
+				}
+			}
+			joined := strings.Join(b.events, ",")
+			for _, x := range test.must {
+				if !strings.Contains(joined, x) {
+					t.Fatalf("missing %s: %s", x, joined)
+				}
+			}
+			for _, x := range test.never {
+				if strings.Contains(joined, x) {
+					t.Fatalf("unexpected %s: %s", x, joined)
+				}
+			}
+			if test.phase == "succeeded" && (s.Active == nil || !s.Policy.Pinned) {
+				t.Fatal("successful deployment/pin not committed")
+			}
+		})
+	}
+}
+
+func TestForcedUpdateKeepsOnlyStillFailingReviewedChecks(t *testing.T) {
+	issue := HealthIssue{Service: "lidar", Check: "application.lidar", Message: "lidar: No fresh LiDAR scans"}
+	m, b, _ := setup(t, "")
+	b.healthSnapshots = [][]HealthIssue{{issue}, {issue}}
+	p, err := m.MakePlan(context.Background(), fixture().ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.PreexistingHealthIssues) != 1 {
+		t.Fatalf("plan did not expose the existing issue: %+v", p)
+	}
+	if _, err = m.Start(p.ID); err == nil || !strings.Contains(err.Error(), "health warning") {
+		t.Fatalf("missing explicit acknowledgement gate: %v", err)
+	}
+	if _, err = m.StartWithAcknowledgements(p.ID, false, false, true); err != nil {
+		t.Fatal(err)
+	}
+	s := settled(t, m)
+	if s.Job.Phase != "succeeded" || len(s.Job.Plan.PreexistingHealthIssues) != 1 || len(s.Job.RemainingHealthIssues) != 1 {
+		t.Fatalf("forced update did not retain its audit record: %+v", s.Job)
+	}
+	if len(b.verifiedHealth) != 1 || len(b.verifiedHealth[0]) != 1 || healthIssueKey(b.verifiedHealth[0][0]) != healthIssueKey(issue) {
+		t.Fatalf("verification received the wrong exception: %+v", b.verifiedHealth)
+	}
+}
+
+func TestForcedUpdateRejectsAHealthFailureIntroducedAfterReview(t *testing.T) {
+	reviewed := HealthIssue{Service: "lidar", Check: "application.lidar", Message: "lidar: No fresh LiDAR scans"}
+	newFailure := HealthIssue{Service: "gps", Check: "application.gps", Message: "gps: receiver disconnected"}
+	m, b, _ := setup(t, "")
+	b.healthSnapshots = [][]HealthIssue{{reviewed}, {reviewed, newFailure}}
+	p, err := m.MakePlan(context.Background(), fixture().ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.StartWithAcknowledgements(p.ID, false, false, true); err != nil {
+		t.Fatal(err)
+	}
+	s := settled(t, m)
+	if s.Job.Phase != "failed" || !strings.Contains(s.Job.Error, "gps: receiver disconnected") {
+		t.Fatalf("new failure did not stop before maintenance: %+v", s.Job)
+	}
+	if strings.Contains(strings.Join(b.events, ","), "gate") {
+		t.Fatalf("new failure entered maintenance: %v", b.events)
+	}
+}
+
+func TestRecoveredIssueLosesItsPostUpdateException(t *testing.T) {
+	issue := HealthIssue{Service: "lidar", Check: "application.lidar", Message: "lidar: No fresh LiDAR scans"}
+	m, b, _ := setup(t, "")
+	b.healthSnapshots = [][]HealthIssue{{issue}, nil}
+	p, err := m.MakePlan(context.Background(), fixture().ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.StartWithAcknowledgements(p.ID, false, false, true); err != nil {
+		t.Fatal(err)
+	}
+	s := settled(t, m)
+	if s.Job.Phase != "succeeded" || len(s.Job.Plan.PreexistingHealthIssues) != 0 {
+		t.Fatalf("recovered check kept an exception: %+v", s.Job)
+	}
+	if len(b.verifiedHealth) != 1 || len(b.verifiedHealth[0]) != 0 {
+		t.Fatalf("verification received a recovered exception: %+v", b.verifiedHealth)
+	}
+}
+
+func TestRemovedServiceIsOutsideForcedHealthScope(t *testing.T) {
+	previous := map[string]string{"mowgli": "old-ros", "lidar": "old-lidar"}
+	target := map[string]string{"mowgli": "new-ros"}
+	scope := retainedHealthScope(previous, target)
+	if len(scope) != 1 || scope["mowgli"] != "old-ros" {
+		t.Fatalf("health review included a service removed by the target: %+v", scope)
+	}
+}
+func TestStalePlanNeverStopsContainers(t *testing.T) {
+	m, b, _ := setup(t, "")
+	p, e := m.MakePlan(context.Background(), fixture().ID, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	b.fingerprint = "changed"
+	_, _ = m.Start(p.ID)
+	s := settled(t, m)
+	if s.Job.Phase != "failed" {
+		t.Fatal(s.Job)
+	}
+	for _, e := range b.events {
+		if e == "gate" || e == "pull" {
+			t.Fatal(b.events)
+		}
+	}
+}
+func TestInterruptedApplyRecoversFromJournal(t *testing.T) {
+	m, b, _ := setup(t, "")
+	p, e := m.MakePlan(context.Background(), fixture().ID, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	m.state.Job = &Job{ID: "interrupted", Phase: "applying", Plan: p, Backup: "backup", PreviousPolicy: m.state.Policy}
+	if e = m.save(); e != nil {
+		t.Fatal(e)
+	}
+	m2, e := Open(filepath.Dir(m.path), m.trusted, b, m.source)
+	if e != nil {
+		t.Fatal(e)
+	}
+	m2.Recover()
+	s := settled(t, m2)
+	if s.Job.Phase != "rolled_back" {
+		t.Fatal(s.Job)
+	}
+	if s.Active != nil {
+		t.Fatal("failed target became active")
+	}
+}
+func TestRollbackFailureKeepsMaintenance(t *testing.T) {
+	m, b, _ := setup(t, "")
+	p, e := m.MakePlan(context.Background(), fixture().ID, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	m.state.Job = &Job{ID: "interrupted", Phase: "applying", Plan: p, Backup: "backup", PreviousPolicy: m.state.Policy}
+	b.fail = "restore"
+	m.Recover()
+	s := settled(t, m)
+	if s.Job.Phase != "recovery_required" {
+		t.Fatal(s.Job)
+	}
+	if s.Job.RecoveryError != "injected restore" {
+		t.Fatalf("recovery failure was not recorded separately: %+v", s.Job)
+	}
+	for _, e := range b.events {
+		if e == "ungate" {
+			t.Fatal("failed rollback released maintenance")
+		}
+	}
+}
+
+func TestRecoveryFailurePreservesActivationFailure(t *testing.T) {
+	m, b, _ := setup(t, "")
+	p, e := m.MakePlan(context.Background(), fixture().ID, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	m.state.Job = &Job{
+		ID:             "interrupted",
+		Phase:          "rolling_back",
+		Error:          "Update verification failed: gps: receiver disconnected",
+		Plan:           p,
+		Backup:         "backup",
+		PreviousPolicy: m.state.Policy,
+	}
+	b.fail = "restore"
+	m.Recover()
+	s := settled(t, m)
+	if s.Job.Phase != "recovery_required" {
+		t.Fatal(s.Job)
+	}
+	if s.Job.Error != "Update verification failed: gps: receiver disconnected" {
+		t.Fatalf("recovery replaced the activation failure: %+v", s.Job)
+	}
+	if s.Job.RecoveryError != "injected restore" {
+		t.Fatalf("restore verification failure is missing: %+v", s.Job)
+	}
+	b.fail = ""
+	m.Recover()
+	s = settled(t, m)
+	if s.Job.Phase != "rolled_back" || s.Job.RecoveryError != "" {
+		t.Fatalf("successful retry retained a stale recovery failure: %+v", s.Job)
+	}
+}
+
+func TestRollbackCompletesWithAdvisoryModuleWarnings(t *testing.T) {
+	m, b, _ := setup(t, "verify-new")
+	b.recoveryWarnings = []string{"camera: no frames received"}
+	p, err := m.MakePlan(context.Background(), fixture().ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Start(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	s := settled(t, m)
+	if s.Job.Phase != "rolled_back" || s.Job.RecoveryError != "" {
+		t.Fatalf("advisory module warning blocked rollback: %+v", s.Job)
+	}
+	if strings.Join(s.Job.RecoveryWarnings, "; ") != "camera: no frames received" {
+		t.Fatalf("advisory module warning was not retained: %+v", s.Job)
+	}
+	if b.events[len(b.events)-1] != "ungate" {
+		t.Fatalf("successful rollback did not release maintenance: %v", b.events)
+	}
+}
+
+func TestCommittedUpdateOnlyRetriesMaintenanceRelease(t *testing.T) {
+	m, b, _ := setup(t, "ungate")
+	p, err := m.MakePlan(context.Background(), fixture().ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Start(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	s := settled(t, m)
+	if s.Job.Phase != "recovery_required" || s.Job.Committed != "succeeded" {
+		t.Fatal(s.Job)
+	}
+	b.fail = ""
+	m2, err := Open(filepath.Dir(m.path), m.trusted, b, m.source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2.Recover()
+	s = settled(t, m2)
+	if s.Job.Phase != "succeeded" || s.Active == nil || s.Active.ID != p.Target.ID {
+		t.Fatal(s.Job)
+	}
+	for _, event := range b.events {
+		if event == "restore" || event == "apply-old" {
+			t.Fatal("committed deployment was rolled back", b.events)
+		}
+	}
+}
+func TestSourceAndDescriptorValidation(t *testing.T) {
+	trusted := []string{"mowglinext/mowglinext"}
+	d := fixture()
+	if e := d.Validate(trusted); e != nil {
+		t.Fatal(e)
+	}
+	d.Source = Source{Repository: trusted[0], Track: "custom", Branch: "feat/my-version"}
+	if e := d.Validate(trusted); e != nil {
+		t.Fatal(e)
+	}
+	for _, branch := range []string{"", "../dev", "dev\nmain", "-force"} {
+		d.Source.Branch = branch
+		if d.Validate(trusted) == nil {
+			t.Fatalf("accepted %q", branch)
+		}
+	}
+	d = fixture()
+	d.Images["gps"] = updates.Image{Repository: "ghcr.io/other/repo/gps", Digest: "sha256:" + strings.Repeat("b", 64)}
+	if d.Validate(trusted) == nil {
+		t.Fatal("untrusted image accepted")
+	}
+}

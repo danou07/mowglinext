@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.22.1)
 project(mowgli_map)
 
 # ---------------------------------------------------------------------------
@@ -9,7 +9,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -46,6 +46,7 @@ add_library(mowgli_map_lib STATIC
   src/area_manager.cpp
   src/costmap_filters.cpp
   src/progress_tracker.cpp
+  src/lidar_corridor_manager.cpp
 )
 
 target_include_directories(mowgli_map_lib PUBLIC
@@ -54,19 +55,20 @@ target_include_directories(mowgli_map_lib PUBLIC
   ${Boost_INCLUDE_DIRS}
 )
 
-ament_target_dependencies(mowgli_map_lib
-  rclcpp
-  std_msgs
-  std_srvs
-  nav_msgs
-  geometry_msgs
-  grid_map_core
-  grid_map_ros
-  grid_map_msgs
-  mowgli_interfaces
-  nav2_msgs
-  tf2_ros
+target_link_libraries(mowgli_map_lib
+  ${rclcpp_TARGETS}
+  ${std_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${grid_map_core_TARGETS}
+  ${grid_map_ros_LIBRARIES}
+  ${grid_map_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
+  ${nav2_msgs_TARGETS}
+  ${tf2_ros_TARGETS}
 )
+target_include_directories(mowgli_map_lib PUBLIC ${grid_map_ros_INCLUDE_DIRS})
 
 # ---------------------------------------------------------------------------
 # Library: mowgli_obstacle_tracker_lib
@@ -83,17 +85,17 @@ target_include_directories(mowgli_obstacle_tracker_lib PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-ament_target_dependencies(mowgli_obstacle_tracker_lib
-  rclcpp
-  std_srvs
-  nav_msgs
-  map_msgs
-  geometry_msgs
-  sensor_msgs
-  visualization_msgs
-  mowgli_interfaces
-  tf2_ros
-  tf2_geometry_msgs
+target_link_libraries(mowgli_obstacle_tracker_lib
+  ${rclcpp_TARGETS}
+  ${std_srvs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${map_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${visualization_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
+  ${tf2_ros_TARGETS}
+  ${tf2_geometry_msgs_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -108,8 +110,8 @@ target_link_libraries(map_server_node
   mowgli_map_lib
 )
 
-ament_target_dependencies(map_server_node
-  rclcpp
+target_link_libraries(map_server_node
+  ${rclcpp_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -124,8 +126,8 @@ target_link_libraries(obstacle_tracker_node
   mowgli_obstacle_tracker_lib
 )
 
-ament_target_dependencies(obstacle_tracker_node
-  rclcpp
+target_link_libraries(obstacle_tracker_node
+  ${rclcpp_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -160,6 +162,10 @@ install(DIRECTORY include/
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  # Every test that brings up rclcpp runs through ament_add_ros_isolated_gtest:
+  # colcon tests packages in parallel, and on one shared DDS domain the test
+  # processes discover each other's nodes (docs/claude/testing-ci.md).
+  find_package(ament_cmake_ros REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
@@ -169,7 +175,7 @@ if(BUILD_TESTING)
   set(ament_cmake_uncrustify_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 
-  ament_add_gtest(test_map_server
+  ament_add_ros_isolated_gtest(test_map_server
     test/test_map_server.cpp
   )
 
@@ -177,17 +183,57 @@ if(BUILD_TESTING)
     mowgli_map_lib
   )
 
-  ament_target_dependencies(test_map_server
-    rclcpp
-    grid_map_core
-    grid_map_ros
-    grid_map_msgs
-    nav_msgs
-    geometry_msgs
-    mowgli_interfaces
+  target_link_libraries(test_map_server
+    ${rclcpp_TARGETS}
+    ${grid_map_core_TARGETS}
+    ${grid_map_ros_LIBRARIES}
+    ${grid_map_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
+  )
+  target_include_directories(test_map_server PUBLIC ${grid_map_ros_INCLUDE_DIRS})
+
+  # SafeTransformListener: back-to-back build/destroy never hangs (tf2_ros's own
+  # dedicated-thread listener can lose its cancel and hang the destructor).
+  ament_add_ros_isolated_gtest(test_safe_transform_listener
+    test/test_safe_transform_listener.cpp
+    TIMEOUT 120
+  )
+  target_include_directories(test_safe_transform_listener PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  target_link_libraries(test_safe_transform_listener
+    ${rclcpp_TARGETS}
+    ${tf2_ros_TARGETS}
+    ${tf2_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
   )
 
-  ament_add_gtest(test_mow_progress
+  # Map replace (GUI "Save map"): fast keepout mask == per-cell definition,
+  # and add_area does no grid work inside the service callback.
+  ament_add_ros_isolated_gtest(test_map_replace
+    test/test_map_replace.cpp
+    TIMEOUT 300
+  )
+
+  target_link_libraries(test_map_replace
+    mowgli_map_lib
+  )
+
+  target_link_libraries(test_map_replace
+    ${rclcpp_TARGETS}
+    ${grid_map_core_TARGETS}
+    ${grid_map_ros_LIBRARIES}
+    ${grid_map_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${std_srvs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
+  )
+  target_include_directories(test_map_replace PUBLIC ${grid_map_ros_INCLUDE_DIRS})
+
+  ament_add_ros_isolated_gtest(test_mow_progress
     test/test_mow_progress.cpp
   )
 
@@ -197,17 +243,18 @@ if(BUILD_TESTING)
 
   target_include_directories(test_mow_progress PRIVATE include)
 
-  ament_target_dependencies(test_mow_progress
-    rclcpp
-    grid_map_core
-    grid_map_ros
-    grid_map_msgs
-    nav_msgs
-    geometry_msgs
-    mowgli_interfaces
+  target_link_libraries(test_mow_progress
+    ${rclcpp_TARGETS}
+    ${grid_map_core_TARGETS}
+    ${grid_map_ros_LIBRARIES}
+    ${grid_map_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
   )
+  target_include_directories(test_mow_progress PUBLIC ${grid_map_ros_INCLUDE_DIRS})
 
-  ament_add_gtest(test_obstacle_tracker
+  ament_add_ros_isolated_gtest(test_obstacle_tracker
     test/test_obstacle_tracker.cpp
   )
 
@@ -215,17 +262,17 @@ if(BUILD_TESTING)
     mowgli_obstacle_tracker_lib
   )
 
-  ament_target_dependencies(test_obstacle_tracker
-    rclcpp
-    std_srvs
-    nav_msgs
-    map_msgs
-    geometry_msgs
-    sensor_msgs
-    visualization_msgs
-    mowgli_interfaces
-    tf2_ros
-    tf2_geometry_msgs
+  target_link_libraries(test_obstacle_tracker
+    ${rclcpp_TARGETS}
+    ${std_srvs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${map_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    ${visualization_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
+    ${tf2_ros_TARGETS}
+    ${tf2_geometry_msgs_TARGETS}
   )
 
   # Pure logic, no ROS deps — mirrors fusion_graph's header-only gate tests.
@@ -235,6 +282,14 @@ if(BUILD_TESTING)
   target_include_directories(test_boundary_classifier PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${Boost_INCLUDE_DIRS}
+  )
+
+  # Pure logic, no ROS deps — which gates a SetDockingPoint request must pass.
+  ament_add_gtest(test_dock_set_gates
+    test/test_dock_set_gates.cpp
+  )
+  target_include_directories(test_dock_set_gates PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
 endif()
 

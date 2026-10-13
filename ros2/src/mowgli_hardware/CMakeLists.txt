@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.22.1)
 project(mowgli_hardware)
 
 # ---------------------------------------------------------------------------
@@ -9,7 +9,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -52,8 +52,8 @@ target_link_libraries(mowgli_hardware_core pthread)
 
 # clock_fit.cpp needs rclcpp::Time. Promote rclcpp to the static lib's
 # public deps so test executables also pick it up transitively.
-ament_target_dependencies(mowgli_hardware_core
-  rclcpp
+target_link_libraries(mowgli_hardware_core
+  ${rclcpp_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -69,14 +69,14 @@ target_link_libraries(hardware_bridge_node
   mowgli_hardware_core
 )
 
-ament_target_dependencies(hardware_bridge_node
-  rclcpp
-  std_msgs
-  std_srvs
-  sensor_msgs
-  geometry_msgs
-  nav_msgs
-  mowgli_interfaces
+target_link_libraries(hardware_bridge_node
+  ${rclcpp_TARGETS}
+  ${std_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -109,6 +109,10 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 
   find_package(ament_cmake_gtest REQUIRED)
+  # Every test that brings up rclcpp runs through ament_add_ros_isolated_gtest:
+  # colcon tests packages in parallel, and on one shared DDS domain the test
+  # processes discover each other's nodes (docs/claude/testing-ci.md).
+  find_package(ament_cmake_ros REQUIRED)
 
   # ---- test_cobs ----
   ament_add_gtest(test_cobs
@@ -151,6 +155,17 @@ if(BUILD_TESTING)
     mowgli_hardware_core
   )
 
+  # ---- test_odometry_publisher ----
+  ament_add_ros_isolated_gtest(test_odometry_publisher
+    test/test_odometry_publisher.cpp
+    src/odometry_publisher.cpp
+  )
+  target_link_libraries(test_odometry_publisher
+    mowgli_hardware_core
+    ${nav_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
+  )
+
   # ---- test_dig_detector ----
   # Header-only pure logic (dig_detector.hpp): no link against
   # mowgli_hardware_core needed, just the include path.
@@ -161,7 +176,9 @@ if(BUILD_TESTING)
     PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
-  ament_target_dependencies(test_dig_detector mowgli_interfaces)
+  target_link_libraries(test_dig_detector
+    ${mowgli_interfaces_TARGETS}
+  )
 
   # ---- test_dig_escalation ----
   # Header-only pure logic (dig_escalation.hpp): no link against
@@ -196,6 +213,16 @@ if(BUILD_TESTING)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
 
+  # ---- test_blade_reassert ----
+  # Header-only pure logic (blade_reassert.hpp), same as test_blade_gate.
+  ament_add_gtest(test_blade_reassert
+    test/test_blade_reassert.cpp
+  )
+  target_include_directories(test_blade_reassert
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
   # ---- test_heartbeat_emergency_policy ----
   # The firmware's pure heartbeat safety policy is compiled here directly so
   # all stop/release combinations are verified without physical hardware.
@@ -203,6 +230,26 @@ if(BUILD_TESTING)
     test/test_heartbeat_emergency_policy.cpp
   )
   target_include_directories(test_heartbeat_emergency_policy
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../firmware/stm32/ros_usbnode/include
+  )
+
+  # The firmware's pure physical-input clear policy is compiled here directly
+  # so each safety input is covered without physical hardware.
+  ament_add_gtest(test_emergency_clear_policy
+    test/test_emergency_clear_policy.cpp
+  )
+  target_include_directories(test_emergency_clear_policy
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../firmware/stm32/ros_usbnode/include
+  )
+
+  # The firmware's pure blade-intent policy is compiled here directly to
+  # verify emergency, recovery, explicit-command, and IDLE transitions.
+  ament_add_gtest(test_blade_emergency_policy
+    test/test_blade_emergency_policy.cpp
+  )
+  target_include_directories(test_blade_emergency_policy
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../firmware/stm32/ros_usbnode/include
   )
@@ -243,10 +290,49 @@ if(BUILD_TESTING)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
 
+  # ---- test_drive_gain_sanity ----
+  # Pure header: the wheel-gain deadband gate hardware_bridge applies before
+  # pushing wheel_pid_* to the firmware (stiction-locked gains, 2026-09-15).
+  ament_add_gtest(test_drive_gain_sanity
+    test/test_drive_gain_sanity.cpp
+  )
+  target_include_directories(test_drive_gain_sanity
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- STM32 runtime parameters (protocol v7) ----
+  # The firmware's pure flash-log format and parameter catalog are compiled
+  # here directly (like the heartbeat/emergency policies) so the append-only
+  # persistence rules and the envelope are verified without hardware, and the
+  # host mirror in ll_datatypes.hpp is pinned id for id.
+  ament_add_gtest(test_fw_param_log
+    test/test_fw_param_log.cpp
+  )
+  target_include_directories(test_fw_param_log
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../firmware/stm32/ros_usbnode/include
+  )
+  ament_add_gtest(test_fw_param_catalog
+    test/test_fw_param_catalog.cpp
+  )
+  target_include_directories(test_fw_param_catalog
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../firmware/stm32/ros_usbnode/include
+  )
+  ament_add_gtest(test_firmware_params
+    test/test_firmware_params.cpp
+  )
+  target_include_directories(test_firmware_params
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
   # ---- test_hardware_bridge_parameters ----
   # Includes the node implementation to exercise ROS's actual read-only
   # parameter contract while a missing serial device keeps the test hardware-free.
-  ament_add_gtest(test_hardware_bridge_parameters
+  ament_add_ros_isolated_gtest(test_hardware_bridge_parameters
     test/test_hardware_bridge_parameters.cpp
     src/odometry_publisher.cpp
   )
@@ -257,14 +343,14 @@ if(BUILD_TESTING)
     PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
-  ament_target_dependencies(test_hardware_bridge_parameters
-    rclcpp
-    std_msgs
-    std_srvs
-    sensor_msgs
-    geometry_msgs
-    nav_msgs
-    mowgli_interfaces
+  target_link_libraries(test_hardware_bridge_parameters
+    ${rclcpp_TARGETS}
+    ${std_msgs_TARGETS}
+    ${std_srvs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
   )
 endif()
 

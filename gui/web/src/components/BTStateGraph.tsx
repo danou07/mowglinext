@@ -77,12 +77,17 @@ const STATE_ALIASES: Record<string, string> = {
   'RESUMING_AFTER_RAIN': 'TRANSIT',
   'CRITICAL_BATTERY_DOCKING': 'LOW_BATTERY_DOCKING',
   'CRITICAL_BATTERY_CHARGING': 'CHARGING',
+  'MANUAL_CHARGING': 'CHARGING',
   'COVERAGE_FAILED_DOCKING': 'RETURNING_HOME',
   'PLANNING': 'MOWING',
   'DYNAMIC_OBSTACLE_CLEARED': 'OBSTACLE_BACKOFF',
   // #487: coverage refused because the robot's OWN pose is a lethal/keepout
   // cell. Same family as an obstacle wedge from the operator's point of view.
   'START_POSE_BLOCKED': 'OBSTACLE_BACKOFF',
+  // #500: repeat-dig escalation — held against an object it cannot free
+  // itself from. Obstacle family for the operator; the dashboard card carries
+  // the recovery hint (lift clear then Play, or Home).
+  'DIG_OBSTRUCTION': 'OBSTACLE_BACKOFF',
   'PREFLIGHT_CHECK': 'UNDOCKING',
   'CALIBRATING_HEADING': 'TRANSIT',
   'BOUNDARY_EMERGENCY_STOP': 'EMERGENCY',

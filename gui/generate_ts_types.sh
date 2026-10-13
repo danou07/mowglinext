@@ -172,6 +172,10 @@ ros_to_ts() {
 parse_ts_fields() {
     local file="$1"
     while IFS= read -r line; do
+        # Strip a trailing CR (CRLF-checked-out .msg file, e.g. core.autocrlf
+        # on Windows) before it corrupts the last field's name — same fix as
+        # generate_go_msgs.sh's parse_fields().
+        line="${line%$'\r'}"
         # Strip comments
         line="${line%%#*}"
         # Trim whitespace
@@ -197,6 +201,7 @@ parse_ts_constants() {
     local file="$1"
     local has_constants=false
     while IFS= read -r line; do
+        line="${line%$'\r'}"
         line="${line%%#*}"
         line="$(echo "$line" | xargs)"
         [ -z "$line" ] && continue
@@ -316,6 +321,7 @@ parse_ts_constants() {
     echo "  map_center_y?: number;"
     echo "  navigation_areas?: MapArea[];"
     echo "  working_area?: MapArea[];"
+    echo "  working_area_indices?: number[];"
     echo "  dock_x?: number;"
     echo "  dock_y?: number;"
     echo "  dock_heading?: number;"

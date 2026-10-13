@@ -22,12 +22,12 @@ namespace mowgli_coverage
 {
 
 CoverageServer::CoverageServer(const rclcpp::NodeOptions& options)
-    : nav2_util::LifecycleNode("coverage_server", "", options)
+    : nav2::LifecycleNode("coverage_server", "", options)
 {
   RCLCPP_INFO(get_logger(), "Creating %s", get_name());
 }
 
-nav2_util::CallbackReturn CoverageServer::on_configure(const rclcpp_lifecycle::State& /*state*/)
+nav2::CallbackReturn CoverageServer::on_configure(const rclcpp_lifecycle::State& /*state*/)
 {
   RCLCPP_INFO(get_logger(), "Configuring %s", get_name());
 
@@ -93,27 +93,62 @@ nav2_util::CallbackReturn CoverageServer::on_configure(const rclcpp_lifecycle::S
   // (a deadband diff-drive may track a 0.30 m arc more smoothly than a 0.20 m
   // one); raise toward 0.30 if tight turns induce hesitation. Read live.
   declare_double("connector_turn_radius", 0.20);
+  // How many of the num_headland_passes rings a turn-around connector may
+  // CROSS, counted from the mainland edge outward (issue #497): configuring
+  // more headland passes than this leaves the outermost ones a no-turn zone,
+  // so U-turns stay further from the recorded boundary and clear of objects
+  // sitting just past it. <= 0 (default) or >= num_headland_passes: UNLIMITED
+  // — connectors may use the whole apron out to ring 0's centerline, the
+  // pre-#497 behavior. Has no effect with rings disabled. Read live, like the
+  // other connector geometry knobs, so it is field-tunable without a restart.
+  declare_int("connector_max_headland_passes", 0);
   // Extra buffer (m) grown around drawn map-obstacle polygons (holes) before
   // planning — keeps swaths/connectors off root zones the 2D LiDAR cannot see.
   // Injected at launch from mowgli_robot.yaml.obstacle_margin (GUI: Settings →
   // Obstacles); map_server applies the same key to its keepout mask so transit
   // and coverage keep the same distance. Read LIVE per plan.
   declare_double("obstacle_margin", 0.0);
+  // PIVOT JOINS (PivotJoinLimits in coverage_planning.hpp): a row-end join that
+  // fits no forward arc may stay blade-on as a short straight with in-place
+  // pivots instead of splitting into a blade-off Nav2 transit — only where the
+  // disc the chassis sweeps pivoting about base_link (the REAR wheel axis)
+  // stays inside the recorded boundary grown by map_server's non-lethal soft
+  // band and clear of every drawn obstacle. Both injected at launch, DERIVED
+  // from the live chassis (robot_config_util.chassis_circumscribed_radius /
+  // boundary_soft_margin). The 0.0 defaults DISABLE pivot joins: a server that
+  // was never told the chassis size never pivots. Read live per plan.
+  declare_double("pivot_sweep_radius", 0.0);
+  declare_double("boundary_soft_margin", 0.0);
 
-  // Action server result timeout. Keep this >= the BT client's per-plan wait
-  // (PlanCoverageArea, 12 s): if the server expires the result first the
-  // client's goal handle is invalidated underneath it. 15 s clears the client.
-  double action_server_result_timeout = declare_double("action_server_result_timeout", 15.0);
-  rcl_action_server_options_t server_options = rcl_action_server_get_default_options();
-  server_options.result_timeout.nanoseconds = RCL_S_TO_NS(action_server_result_timeout);
-
+  // Lyrical's SimpleActionServer owns the standard ROS action options.
+  // Result retention starts after completion; it is not a planning deadline.
   action_server_ = std::make_unique<ActionServer>(shared_from_this(),
                                                   "plan_coverage",
                                                   std::bind(&CoverageServer::planCoverage, this),
                                                   nullptr,
+                                                  nullptr,
                                                   std::chrono::milliseconds(500),
-                                                  true,
-                                                  server_options);
+                                                  true);
+
+  // Plain read-only utility service, not lifecycle-gated like the action
+  // server: it neither plans nor touches robot state, so it stays usable as
+  // soon as the node is configured.
+  preview_obstacle_clearance_service_ =
+      create_service<mowgli_interfaces::srv::PreviewObstacleClearance>(
+          "~/preview_obstacle_clearance",
+          std::bind(&CoverageServer::previewObstacleClearance,
+                    this,
+                    std::placeholders::_1,
+                    std::placeholders::_2,
+                    std::placeholders::_3));
+  correct_recorded_obstacle_service_ =
+      create_service<mowgli_interfaces::srv::CorrectRecordedObstacle>(
+          "~/correct_recorded_obstacle",
+          std::bind(&CoverageServer::correctRecordedObstacle,
+                    this,
+                    std::placeholders::_1,
+                    std::placeholders::_2,
+                    std::placeholders::_3));
 
   RCLCPP_INFO(get_logger(),
               "F2C v3 boustrophedon backend ready. robot_width=%.2fm "
@@ -122,36 +157,38 @@ nav2_util::CallbackReturn CoverageServer::on_configure(const rclcpp_lifecycle::S
               operation_width_,
               default_headland_width_,
               num_headland_passes_);
-  return nav2_util::CallbackReturn::SUCCESS;
+  return nav2::CallbackReturn::SUCCESS;
 }
 
-nav2_util::CallbackReturn CoverageServer::on_activate(const rclcpp_lifecycle::State& /*state*/)
+nav2::CallbackReturn CoverageServer::on_activate(const rclcpp_lifecycle::State& /*state*/)
 {
   RCLCPP_INFO(get_logger(), "Activating %s", get_name());
   action_server_->activate();
   createBond();
-  return nav2_util::CallbackReturn::SUCCESS;
+  return nav2::CallbackReturn::SUCCESS;
 }
 
-nav2_util::CallbackReturn CoverageServer::on_deactivate(const rclcpp_lifecycle::State& /*state*/)
+nav2::CallbackReturn CoverageServer::on_deactivate(const rclcpp_lifecycle::State& /*state*/)
 {
   RCLCPP_INFO(get_logger(), "Deactivating %s", get_name());
   action_server_->deactivate();
   destroyBond();
-  return nav2_util::CallbackReturn::SUCCESS;
+  return nav2::CallbackReturn::SUCCESS;
 }
 
-nav2_util::CallbackReturn CoverageServer::on_cleanup(const rclcpp_lifecycle::State& /*state*/)
+nav2::CallbackReturn CoverageServer::on_cleanup(const rclcpp_lifecycle::State& /*state*/)
 {
   RCLCPP_INFO(get_logger(), "Cleaning up %s", get_name());
   action_server_.reset();
-  return nav2_util::CallbackReturn::SUCCESS;
+  preview_obstacle_clearance_service_.reset();
+  correct_recorded_obstacle_service_.reset();
+  return nav2::CallbackReturn::SUCCESS;
 }
 
-nav2_util::CallbackReturn CoverageServer::on_shutdown(const rclcpp_lifecycle::State& /*state*/)
+nav2::CallbackReturn CoverageServer::on_shutdown(const rclcpp_lifecycle::State& /*state*/)
 {
   RCLCPP_INFO(get_logger(), "Shutting down %s", get_name());
-  return nav2_util::CallbackReturn::SUCCESS;
+  return nav2::CallbackReturn::SUCCESS;
 }
 
 namespace
@@ -159,17 +196,11 @@ namespace
 
 constexpr double kSwathStep = 0.10;  // m between poses on a straight swath
 
-// Connector-outcome reporting (issue #499). Share of segment joins resolved by
-// an aligned straight connector or a sub-path split, at or above which the summary
-// is logged at WARN instead of INFO. 25 % is a judgement call, not a measured
-// threshold: below it the odd un-fittable join is normal on a concave field,
-// above it the plan is mostly NOT being joined by real turn-around arcs.
-//
 // The 2026-09-09 field bag measured 146 fallbacks in 168 joins with the old
-// two-pass apron. Production now uses five passes and 0.20 m arcs, so this should
-// remain INFO on ordinary fields. A WARN means the plan will require many
-// blade-off reorientations and the site geometry/configuration needs review.
-constexpr double kConnectorFallbackWarnPct = 25.0;
+// two-pass apron; 2026-09-21 split 127 of 172 with the ring count on AUTO. With
+// pivot joins a join that fits no arc stays blade-on (a pivot join), so the
+// FALLBACK rate (every non-arc join) can legitimately stay high on a thin apron;
+// the SPLIT rate is what costs transits and is what the severity follows.
 // One format string, two severities — keeps the WARN and INFO variants from
 // drifting apart. A macro rather than a `constexpr const char*` so it expands to
 // a string LITERAL at each RCLCPP_* call site: the logging macros carry a
@@ -182,8 +213,9 @@ constexpr double kConnectorFallbackWarnPct = 25.0;
 // each other forever.
 #define MOWGLI_CONNECTOR_STATS_FMT                                             \
   "PlanCoverage connectors: %zu join(s): %zu turn-around arc, %zu straight "   \
-  "aligned fallback (blade-on), %zu split (blade-off transit); fallback rate " \
-  "%.1f%% at connector_turn_radius=%.2f min_turning_radius=%.2f. A high rate " \
+  "aligned fallback (blade-on), %zu pivot join (blade-on, in-place pivots), "  \
+  "%zu split (blade-off transit); fallback rate %.1f%%, split rate %.1f%% at " \
+  "connector_turn_radius=%.2f min_turning_radius=%.2f. A high fallback rate "  \
   "means the available headland/site geometry could not fit the configured "   \
   "turn-around arcs"
 
@@ -475,6 +507,10 @@ void CoverageServer::planCoverage()
     // fillets inside the planner and the turn-around connectors below. Read
     // live so it stays field-tunable per plan.
     const double min_turning_radius = get_parameter("min_turning_radius").as_double();
+    // How many headland passes a turn-around connector may cross (issue
+    // #497), read live like the other connector geometry knobs.
+    const int connector_max_headland_passes =
+        static_cast<int>(get_parameter("connector_max_headland_passes").as_int());
 
     const auto t_plan0 = now();
     BoustrophedonPlan plan = planBoustrophedon(cell,
@@ -485,7 +521,9 @@ void CoverageServer::planCoverage()
                                                mow_angle_rad,
                                                min_swath_length,
                                                ring_direction,
-                                               min_turning_radius);
+                                               min_turning_radius,
+                                               goal->perpendicular,
+                                               connector_max_headland_passes);
     const double plan_ms = 1e3 * (now() - t_plan0).seconds();
 
     // Instrumentation (no behaviour change): surface every piece the planner
@@ -580,16 +618,40 @@ void CoverageServer::planCoverage()
     // toward the operator boundary, an excursion that grew with the turn radius
     // while base_link stayed inside (so the map_server soft-boundary monitor never
     // fired). Bound and VERIFY against the clearance ring; fall back to
-    // safe_boundary, then the raw boundary, only if it degenerated.
+    // safe_boundary, then the raw boundary, only if it degenerated. ALWAYS
+    // ring 0 — never moved by connector_max_headland_passes (see
+    // plan.connector_clearance_boundary's field doc).
     const std::vector<std::pair<double, double>>& connector_boundary =
         plan.connector_clearance_boundary.size() >= 3 ? plan.connector_clearance_boundary
         : plan.safe_boundary.size() >= 3              ? plan.safe_boundary
                                                       : outer;
+    // Tighter envelope for MAINLAND SWATH-TO-SWATH U-turns only (issue #497),
+    // populated by planBoustrophedon only when connector_max_headland_passes
+    // actually restricts something. Empty otherwise, in which case
+    // buildContinuousSubPaths falls back to connector_boundary for every
+    // join — see its swath_turn_boundary parameter doc.
+    const std::vector<std::pair<double, double>> no_swath_override;
+    const std::vector<std::pair<double, double>>& swath_turn_boundary =
+        plan.swath_turn_envelope.size() >= 3 ? plan.swath_turn_envelope : no_swath_override;
     // Nominal turn-around arc radius (m), read live. Smaller => compact U-turns
     // instead of big teardrop loops; floored at min_turning_radius by
     // buildConnector. See the connector_turn_radius declaration for the tuning
     // trade-off.
     const double connector_turn_radius = get_parameter("connector_turn_radius").as_double();
+    // Gate on the plan's ACTUAL resolved ring count (plan.n_headland_passes),
+    // not the raw num_headland_passes_ config: in AUTO (num_headland_passes_
+    // == 0) the limit still applies against the DERIVED ring count, and the
+    // old `< num_headland_passes_` comparison never fired there, silently
+    // hiding the no-turn-zone from the log in the AUTO case.
+    if (connector_max_headland_passes > 0 && connector_max_headland_passes < plan.n_headland_passes)
+    {
+      RCLCPP_INFO(get_logger(),
+                  "PlanCoverage: turn-around connectors limited to %d of %d headland pass(es) "
+                  "(issue #497) — the outermost %d ring(s) are a no-turn zone",
+                  connector_max_headland_passes,
+                  plan.n_headland_passes,
+                  plan.n_headland_passes - connector_max_headland_passes);
+    }
     constexpr double kConnectorStep = 0.03;  // connector densify step (m)
     // Build one or more hole-free, heading-continuous sub-paths. The path breaks
     // at obstacle crossings and at any zero-radius fallback; the BT bridges each
@@ -600,12 +662,38 @@ void CoverageServer::planCoverage()
     // segment join resolved — a real turn-around arc, an aligned straight
     // connector, or a blade-off sub-path split. See ConnectorStats.
     mowgli_coverage::ConnectorStats connector_stats;
+    // Pivot joins: the sweep is tested against the RECORDED geometry (the goal's
+    // raw polygons, before the chassis inset / outward expansion and before
+    // obstacle_margin) — that is what the soft band and the drawn obstacles are
+    // measured from.
+    PivotJoinLimits pivot_limits;
+    pivot_limits.sweep_radius = std::max(0.0, get_parameter("pivot_sweep_radius").as_double());
+    pivot_limits.boundary_margin = std::max(0.0, get_parameter("boundary_soft_margin").as_double());
+    if (pivot_limits.sweep_radius > 0.0)
+    {
+      pivot_limits.recorded_boundary = outer;
+      for (const auto& obstacle : goal->obstacles)
+      {
+        std::vector<std::pair<double, double>> ring;
+        ring.reserve(obstacle.points.size());
+        for (const auto& p : obstacle.points)
+        {
+          ring.emplace_back(p.x, p.y);
+        }
+        if (ring.size() >= 3)
+        {
+          pivot_limits.recorded_obstacles.push_back(std::move(ring));
+        }
+      }
+    }
     const auto subpaths = buildContinuousSubPaths(plan,
                                                   connector_boundary,
                                                   connector_turn_radius,
                                                   min_turning_radius,
                                                   kConnectorStep,
-                                                  &connector_stats);
+                                                  &connector_stats,
+                                                  swath_turn_boundary,
+                                                  pivot_limits);
     const double subpaths_ms = 1e3 * (now() - t_subpaths0).seconds();
 
     result->full_path.header = header;
@@ -630,22 +718,22 @@ void CoverageServer::planCoverage()
     // connector excursion is op_width/2 (~0.08 m) or more, well above it.
     constexpr double kBoundarySlackM = 0.05;
     const auto t_verify0 = now();
+    std::size_t pivot_corners = 0;
     for (const auto& sub : subpaths)
     {
       nav_msgs::msg::Path spath;
       spath.header = header;
+      // Pose yaws per the pivot corner contract: a corner's first pose keeps the
+      // incoming heading, its twin carries the outgoing one (pathHeadings).
+      const std::vector<double> yaws = pathHeadings(sub);
       for (std::size_t i = 0; i < sub.size(); ++i)
       {
         const double x = sub[i].first;
         const double y = sub[i].second;
-        double yaw = 0.0;
-        if (i + 1 < sub.size())
+        const double yaw = yaws[i];
+        if (i > 0 && sub[i] == sub[i - 1])
         {
-          yaw = std::atan2(sub[i + 1].second - y, sub[i + 1].first - x);
-        }
-        else if (i > 0)
-        {
-          yaw = std::atan2(y - sub[i - 1].second, x - sub[i - 1].first);
+          ++pivot_corners;
         }
         if (i > 0)
         {
@@ -683,10 +771,14 @@ void CoverageServer::planCoverage()
         }
         // Sub-paths are split so none crosses a hole; a residual pose inside one
         // means even a straight fallback couldn't be avoided (degenerate
-        // geometry) — surface it as the #333 safety residual.
+        // geometry) — surface it as the #333 safety residual. A pose ON the hole
+        // ring is not inside it: with the headland rings off F2C clips the swath
+        // ends exactly there, where ray casting is ambiguous (the 2026-09-21
+        // lawn: 35 false "inside" ends, 0 beyond 1 mm).
+        constexpr double kOnHoleEdgeM = 0.001;
         for (const auto& hole : plan.safe_holes)
         {
-          if (pointInRing(x, y, hole))
+          if (pointInRing(x, y, hole) && distanceToRing(x, y, hole) > kOnHoleEdgeM)
           {
             ++in_hole;
             break;
@@ -719,20 +811,24 @@ void CoverageServer::planCoverage()
     // A/B'ing a radius sees it without turning on debug logging.
     if (connector_stats.attempted > 0)
     {
-      const std::size_t fallbacks = connector_stats.straight_kept + connector_stats.split;
-      const double fallback_pct =
-          100.0 * static_cast<double>(fallbacks) / static_cast<double>(connector_stats.attempted);
+      const double attempted = static_cast<double>(connector_stats.attempted);
+      const std::size_t fallbacks =
+          connector_stats.straight_kept + connector_stats.pivot + connector_stats.split;
+      const double fallback_pct = 100.0 * static_cast<double>(fallbacks) / attempted;
+      const double split_pct = 100.0 * static_cast<double>(connector_stats.split) / attempted;
       // Same text either way; only the severity changes, so a routine plan stays
-      // at INFO and a plan that is mostly straight joins is impossible to miss.
-      if (fallback_pct >= kConnectorFallbackWarnPct)
+      // at INFO and a plan that is mostly blade-off transits is impossible to miss.
+      if (connectorSplitRateWarns(connector_stats))
       {
         RCLCPP_WARN(get_logger(),
                     MOWGLI_CONNECTOR_STATS_FMT,
                     connector_stats.attempted,
                     connector_stats.arc,
                     connector_stats.straight_kept,
+                    connector_stats.pivot,
                     connector_stats.split,
                     fallback_pct,
+                    split_pct,
                     connector_turn_radius,
                     min_turning_radius);
       }
@@ -743,11 +839,31 @@ void CoverageServer::planCoverage()
                     connector_stats.attempted,
                     connector_stats.arc,
                     connector_stats.straight_kept,
+                    connector_stats.pivot,
                     connector_stats.split,
                     fallback_pct,
+                    split_pct,
                     connector_turn_radius,
                     min_turning_radius);
       }
+    }
+    if (connector_stats.pivot > 0)
+    {
+      RCLCPP_INFO(get_logger(),
+                  "PlanCoverage: %zu pivot join(s) kept blade-on — %zu in-place pivot corner(s) "
+                  "(sweep radius %.3f m within the recorded boundary + %.3f m soft band, clear "
+                  "of %zu drawn obstacle(s))",
+                  connector_stats.pivot,
+                  pivot_corners,
+                  pivot_limits.sweep_radius,
+                  pivot_limits.boundary_margin,
+                  pivot_limits.recorded_obstacles.size());
+    }
+    else if (pivot_limits.sweep_radius <= 0.0 && connector_stats.split > 0)
+    {
+      RCLCPP_INFO(get_logger(),
+                  "PlanCoverage: pivot joins disabled (pivot_sweep_radius not injected) — every "
+                  "join that fits no turn-around arc is split");
     }
     if (result->drivable_subpaths.size() > 1)
     {
@@ -828,6 +944,85 @@ void CoverageServer::planCoverage()
     result->message = e.what();
     action_server_->terminate_current(result);
   }
+}
+
+void CoverageServer::previewObstacleClearance(
+    const std::shared_ptr<rmw_request_id_s> /*request_header*/,
+    const std::shared_ptr<mowgli_interfaces::srv::PreviewObstacleClearance::Request> request,
+    std::shared_ptr<mowgli_interfaces::srv::PreviewObstacleClearance::Response> response)
+{
+  // Same clamp as planCoverage's live read: a stray `ros2 param set` cannot
+  // make the preview claim a margin bigger than any real plan would ever use.
+  const double obstacle_margin = std::clamp(get_parameter("obstacle_margin").as_double(), 0.0, 1.0);
+  response->obstacle_margin_m = obstacle_margin;
+  response->buffered.reserve(request->obstacles.size());
+
+  for (const auto& obstacle : request->obstacles)
+  {
+    f2c::types::LinearRing ring;
+    for (const auto& p : obstacle.points)
+    {
+      ring.addPoint(f2c::types::Point(p.x, p.y));
+    }
+    // bufferRingOutward is the EXACT function buildCellFromGoal grows every
+    // drawn-obstacle hole with for a real plan — reused here, not
+    // reimplemented, so the preview can never drift from what planning
+    // actually does.
+    const f2c::types::LinearRing grown = bufferRingOutward(dedupClosedRing(ring), obstacle_margin);
+
+    geometry_msgs::msg::Polygon out;
+    out.points.reserve(grown.size());
+    for (std::size_t i = 0; i < grown.size(); ++i)
+    {
+      const auto p = grown.getGeometry(i);
+      geometry_msgs::msg::Point32 pt;
+      pt.x = static_cast<float>(p.getX());
+      pt.y = static_cast<float>(p.getY());
+      out.points.push_back(pt);
+    }
+    response->buffered.push_back(std::move(out));
+  }
+}
+
+void CoverageServer::correctRecordedObstacle(
+    const std::shared_ptr<rmw_request_id_s> /*request_header*/,
+    const std::shared_ptr<mowgli_interfaces::srv::CorrectRecordedObstacle::Request> request,
+    std::shared_ptr<mowgli_interfaces::srv::CorrectRecordedObstacle::Response> response)
+{
+  // Raw physical half-width ONLY — no +0.05 m footprint margin, no
+  // obstacle_margin. Those are planning clearances; this corrects a
+  // RECORDING for where the chassis edge actually was, so adding either
+  // would erode past the true physical surface the operator traced.
+  const double half_width = robot_width_ / 2.0;
+
+  f2c::types::LinearRing ring;
+  for (const auto& p : request->polygon.points)
+  {
+    ring.addPoint(f2c::types::Point(p.x, p.y));
+  }
+  const f2c::types::LinearRing corrected = erodeRingInward(dedupClosedRing(ring), half_width);
+
+  if (corrected.size() < 3)
+  {
+    response->success = false;
+    response->message = "Obstacle collapsed once corrected for the chassis half-width (" +
+                        std::to_string(half_width) +
+                        " m) — it was recorded too small/thin to exist once the extra "
+                        "recording margin is removed. Re-record it, driving a wider loop.";
+    RCLCPP_WARN(get_logger(), "correct_recorded_obstacle: %s", response->message.c_str());
+    return;
+  }
+
+  response->corrected.points.reserve(corrected.size());
+  for (std::size_t i = 0; i < corrected.size(); ++i)
+  {
+    const auto p = corrected.getGeometry(i);
+    geometry_msgs::msg::Point32 pt;
+    pt.x = static_cast<float>(p.getX());
+    pt.y = static_cast<float>(p.getY());
+    response->corrected.points.push_back(pt);
+  }
+  response->success = true;
 }
 
 }  // namespace mowgli_coverage
