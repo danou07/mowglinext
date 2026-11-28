@@ -235,14 +235,69 @@ TEST(ManualResumeHelperTest, ResumingTheSameRunKeepsTheSingleAreaClip)
   EXPECT_FALSE(startClearsSingleAreaMode("IDLE"));
 }
 
+TEST(ManualResumeHelperTest, SafetyAndObstacleHoldsKeepTheSingleAreaClip)
+{
+  // Resuming from a safety or obstacle hold (or right after the guard releases
+  // into PREFLIGHT_CHECK / UNDOCKING / MOWING, e.g. clear_dig_escalation or
+  // emergency re-arm followed by COMMAND_START) must continue the targeted
+  // zone instead of dropping single_area_target and restarting at area 0.
+  for (const std::string& state : {"EMERGENCY",
+                                   "DIG_OBSTRUCTION",
+                                   "BOUNDARY_EMERGENCY_STOP",
+                                   "BOUNDARY_RECOVERY",
+                                   "WAITING_FOR_RTK",
+                                   "RAIN_WAITING",
+                                   "MANUAL_CHARGING",
+                                   "OBSTACLE_BACKOFF",
+                                   "START_POSE_BLOCKED",
+                                   "PREFLIGHT_CHECK",
+                                   "UNDOCKING",
+                                   "CALIBRATING_HEADING",
+                                   "PLANNING",
+                                   "TRANSIT",
+                                   "MOWING"})
+  {
+    EXPECT_FALSE(startClearsSingleAreaMode(state)) << "state=" << state;
+  }
+}
+
 TEST(ManualResumeHelperTest, AFreshStartStillClearsAStaleSingleAreaClip)
 {
   // "Start" from a finished or never-started session, or with no status yet,
   // means the whole lawn: a stale clip must not survive it.
   EXPECT_TRUE(startClearsSingleAreaMode("IDLE_DOCKED"));
-  EXPECT_TRUE(startClearsSingleAreaMode("MOWING"));
+  EXPECT_TRUE(startClearsSingleAreaMode("MOWING_COMPLETE"));
   EXPECT_TRUE(startClearsSingleAreaMode("CHARGER_FAILED"));
+  EXPECT_TRUE(startClearsSingleAreaMode("RECORDING_COMPLETE"));
+  EXPECT_TRUE(startClearsSingleAreaMode("RETURNING_HOME"));
   EXPECT_TRUE(startClearsSingleAreaMode(""));
+}
+
+TEST(ManualResumeHelperTest, MultiAreaResumePrefersCurrentAreaAfterSafetyHold)
+{
+  using mowgli_behavior::shouldPreferCurrentAreaOnStart;
+
+  BTContext ctx;
+  ctx.current_area = 2;
+  EXPECT_TRUE(shouldPreferCurrentAreaOnStart(ctx, true));
+  EXPECT_FALSE(shouldPreferCurrentAreaOnStart(ctx, false));
+
+  // Already in area 0: normal ascending scan already starts at 0.
+  ctx.current_area = 0;
+  EXPECT_FALSE(shouldPreferCurrentAreaOnStart(ctx, true));
+
+  // Completed or retired area must not be preferred again.
+  ctx.current_area = 2;
+  ctx.completed_areas.insert(2);
+  EXPECT_FALSE(shouldPreferCurrentAreaOnStart(ctx, true));
+  ctx.completed_areas.clear();
+  ctx.attempted_areas.insert(2);
+  EXPECT_FALSE(shouldPreferCurrentAreaOnStart(ctx, true));
+  ctx.attempted_areas.clear();
+
+  // Single-area runs already use single_area_target directly.
+  ctx.single_area_target = 2u;
+  EXPECT_FALSE(shouldPreferCurrentAreaOnStart(ctx, true));
 }
 
 // ---------------------------------------------------------------------------

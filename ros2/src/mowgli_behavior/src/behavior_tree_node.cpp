@@ -981,17 +981,26 @@ private:
             //
             // EXCEPTIONS (startClearsSingleAreaMode): not while parked in
             // StopHoldSequence's IDLE — the operator's own "Pause" on a run
-            // still in progress — and not in a battery charge hold, where this
-            // START was just flagged above as a manual "Resume now" of the
-            // SAME run. Either way the operator continues that targeted area;
-            // widening to the whole lawn sent a nearly finished area-2 run
-            // back to area 0 (field report 2026-10-05). IDLE_DOCKED (session
-            // ended) and every other state keep the clear.
-            if (cmd == HighLevelControl::Request::COMMAND_START &&
-                startClearsSingleAreaMode(context_->last_high_level_status.state_name,
-                                          context_->resume_after_incomplete_end))
+            // still in progress — not in a battery charge hold, and not in a
+            // mid-session safety/obstacle hold or active mowing state
+            // (DIG_OBSTRUCTION, EMERGENCY, BOUNDARY_EMERGENCY_STOP, or the
+            // PREFLIGHT_CHECK/MOWING tick immediately after a guard releases).
+            // Either way the operator continues that targeted area instead of
+            // widening to the whole lawn and jumping back to area 0.
+            // IDLE_DOCKED (without kept incomplete progress) and ended/non-
+            // mowing states keep the clear.
+            const bool keeps_active_session =
+                !startClearsSingleAreaMode(context_->last_high_level_status.state_name,
+                                           context_->resume_after_incomplete_end);
+            if (cmd == HighLevelControl::Request::COMMAND_START && !keeps_active_session)
             {
               clearSingleAreaMode(*context_);
+            }
+            if (cmd == HighLevelControl::Request::COMMAND_START &&
+                !context_->resume_after_incomplete_end &&
+                shouldPreferCurrentAreaOnStart(*context_, keeps_active_session))
+            {
+              context_->resume_preferred_start = static_cast<uint32_t>(context_->current_area);
             }
             if (cmd == HighLevelControl::Request::COMMAND_START)
             {
@@ -1821,6 +1830,8 @@ private:
     {
       std::lock_guard<std::mutex> lock(context_->context_mutex);
       context_->resume_after_incomplete_end = false;
+      context_->resume_preferred_start.reset();
+      clearSingleAreaMode(*context_);
       clearRecordedCoverageProgress(*context_);
       context_->attempted_areas.clear();
       context_->incomplete_retired_areas.clear();

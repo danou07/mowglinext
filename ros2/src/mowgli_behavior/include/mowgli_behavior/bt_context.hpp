@@ -1265,18 +1265,65 @@ inline bool restoredProgressExpired(std::chrono::system_clock::time_point saved_
   return now - saved_at > kIncompleteResumeMaxAge;
 }
 
+/// True for mid-session safety, obstacle, or guard hold states and active mowing
+/// states where a plain COMMAND_START is resuming or confirming the SAME run.
+///
+/// Covers two coupled cases:
+///   * Safety / obstacle holds (DIG_OBSTRUCTION, EMERGENCY, BOUNDARY_EMERGENCY_STOP,
+///     WAITING_FOR_RTK, RAIN_WAITING, MANUAL_CHARGING, ...): the GUI's Resume /
+///     "Clear & resume" button sends COMMAND_START (after releasing the hold for
+///     DIG_OBSTRUCTION), and clearing single_area_target there abandons the current
+///     zone and restarts at area 0.
+///   * Active mowing / guard-release transition states (PREFLIGHT_CHECK, UNDOCKING,
+///     CALIBRATING_HEADING, PLANNING, TRANSIT, MOWING, ...): releasing a guard
+///     (e.g. clear_dig_escalation or emergency re-arm) lets the BT re-enter
+///     MowingSequence on the very next tick, BEFORE the GUI's follow-up
+///     COMMAND_START arrives. Treating those states as a fresh full-lawn start
+///     would still drop single_area_target and redirect the robot to area 0.
+inline bool isMidSessionResumeState(const std::string& state_name)
+{
+  return state_name == "EMERGENCY" || state_name == "DIG_OBSTRUCTION" ||
+         state_name == "BOUNDARY_EMERGENCY_STOP" || state_name == "BOUNDARY_RECOVERY" ||
+         state_name == "WAITING_FOR_RTK" || state_name == "RAIN_WAITING" ||
+         state_name == "RAIN_DETECTED_DOCKING" || state_name == "RAIN_DOCK_FAILED" ||
+         state_name == "RAIN_TIMEOUT" || state_name == "MANUAL_CHARGING" ||
+         state_name == "UNDOCK_FAILED" || state_name == "OBSTACLE_BACKOFF" ||
+         state_name == "START_POSE_BLOCKED" || state_name == "DYNAMIC_OBSTACLE_CLEARED" ||
+         state_name == "AREA_UNREACHABLE" || state_name == "PREFLIGHT_CHECK" ||
+         state_name == "UNDOCKING" || state_name == "CALIBRATING_HEADING" ||
+         state_name == "PLANNING" || state_name == "TRANSIT" || state_name == "MOWING" ||
+         state_name == "RESUMING_UNDOCKING" || state_name == "RESUMING_AFTER_RAIN" ||
+         state_name == "LOW_BATTERY_DOCKING" || state_name == "CRITICAL_BATTERY_DOCKING" ||
+         state_name == "CRITICAL_BATTERY_NAV_FAILED";
+}
+
 /// Should a plain COMMAND_START received while the tree publishes `state_name`
 /// drop the single-area clip (clearSingleAreaMode)? No when it continues the
-/// SAME run — a Pause → Play from plain IDLE, or a manual "Resume now" out of
-/// a battery charge hold — and yes everywhere else, where a Start means "mow
-/// the lawn" (IDLE_DOCKED, MOWING, no status yet, ...). A session that ended
-/// unfinished with its progress kept (BTContext::resume_after_incomplete_end) is
-/// continued as well: Play resumes the area that was in progress.
+/// SAME run — a Pause → Play from plain IDLE, a manual "Resume now" out of a
+/// battery charge hold, a safety/obstacle hold or active mowing state
+/// (isMidSessionResumeState), or a kept unfinished session
+/// (BTContext::resume_after_incomplete_end). Yes from finished/idle-docked/non-
+/// mowing states (IDLE_DOCKED, CHARGER_FAILED, MOWING_COMPLETE, no status yet,
+/// ...) where Start means "mow the lawn".
 inline bool startClearsSingleAreaMode(const std::string& state_name,
                                       bool resume_after_incomplete_end = false)
 {
   return !keepsSingleAreaOnStart(state_name, resume_after_incomplete_end) &&
-         !isChargeHoldState(state_name);
+         !isChargeHoldState(state_name) && !isMidSessionResumeState(state_name);
+}
+
+/// When a plain COMMAND_START continues an active multi-area session (no
+/// single-area clip) after a pause or safety/obstacle hold, prefer scanning
+/// from the area that was in progress so GetNextUnmowedArea finishes it before
+/// wrapping back to area 0.
+inline bool shouldPreferCurrentAreaOnStart(const BTContext& ctx, bool keeps_active_session)
+{
+  if (!keeps_active_session || ctx.single_area_target.has_value() || ctx.current_area <= 0)
+  {
+    return false;
+  }
+  const auto area = static_cast<uint32_t>(ctx.current_area);
+  return ctx.completed_areas.count(area) == 0 && ctx.attempted_areas.count(area) == 0;
 }
 
 }  // namespace mowgli_behavior
